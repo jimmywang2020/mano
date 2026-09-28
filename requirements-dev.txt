@@ -1,0 +1,3 @@
+# Runtime has ZERO third-party dependencies (Python standard library only).
+# These are development-only tools.
+pytest>=8

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mano"
+version = "0.1.0"
+description = "A thin VLM-driven Android GUI automation engine with per-app packs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "jimmywang2020" }]
+keywords = ["android", "adb", "vlm", "gui-automation", "agent"]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["mano", "packs", "packs.duolingo"]

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets / machine-specific env
+.env
+.env.*
+!.env.example
+
+# Run evidence: screenshots + UI XML can contain personal account data.
+# Never publish. Keep local unless a reviewed, redacted package is prepared.
+packs/*/runs/
+runs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
