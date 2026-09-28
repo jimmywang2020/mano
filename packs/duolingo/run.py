@@ -220,6 +220,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             log({"step": step, "screenshot": shot.name, "guard": "paywall"})
             result = "paywall_handed_to_human"
             break
+        # 笼①半:能量/红心耗尽浮层——停机交人(浮层背后题面会误路由进 solver 空转烧 VLM)
+        if guards.energy_depleted(xml):
+            log({"step": step, "screenshot": shot.name, "guard": "energy_depleted"})
+            result = "energy_depleted"
+            break
         # 笼②:本节课已完成——课后推新挑战/跳级/加油宝箱即边界,不再往后游荡
         if guards.bonus_offer_detected(xml):
             log({"step": step, "screenshot": shot.name, "guard": "lesson_done"})

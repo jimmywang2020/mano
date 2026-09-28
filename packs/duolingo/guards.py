@@ -6,12 +6,23 @@ import re
 
 # 命中即"停+交人"(安全失败方向,宁误拦不误点付费)。首跑后按实际 XML 微调。
 PAYWALL_MARKERS = (
-    "Super", "超级多邻国", "免费试用", "订阅", "购买", "家庭方案", "free trial",
+    "Super", "SUPER", "超级多邻国", "免费试用", "订阅", "订购", "购买", "家庭方案", "free trial",
 )
 
 
 def paywall_detected(xml_text: str) -> bool:
     return any(marker in xml_text for marker in PAYWALL_MARKERS)
+
+
+# 能量/红心耗尽浮层("能量用完了")。题面仍留在 XML 里,不拦会误路由进 solver 空转烧 VLM,
+# 且浮层含"订购SUPER"。命中即安全停机交人,绝不点订阅/花宝石/看广告。
+ENERGY_DEPLETED_MARKERS = (
+    "能量用完了", "能量已用完", "获得无限能量", "补满能量",
+)
+
+
+def energy_depleted(xml_text: str) -> bool:
+    return any(marker in xml_text for marker in ENERGY_DEPLETED_MARKERS)
 
 
 # 单节课已完成的信号:课后会推"新挑战/跳级测试/加油宝箱"等新循环,命中即视为本节课结束。
