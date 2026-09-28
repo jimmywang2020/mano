@@ -37,6 +37,11 @@ class GuiVLM:
             raise ManoError("MANO_API_KEY (or DASHSCOPE_API_KEY) is not set")
         self.model = os.getenv("MANO_MODEL", DEFAULT_MODEL)
         self.endpoint = endpoint_from_base(os.getenv("MANO_BASE_URL", DEFAULT_BASE_URL))
+        # Metrics accumulated across every call (this is the single chokepoint).
+        self.call_count = 0
+        self.retries = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
 
     def complete(self, messages: list[dict[str, Any]], max_tokens: int = 700) -> dict[str, Any]:
         payload = {
@@ -59,7 +64,7 @@ class GuiVLM:
         )
         try:
             with urllib.request.urlopen(request, timeout=90) as response:
-                return json.loads(response.read().decode("utf-8"))
+                result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             try:
@@ -76,6 +81,11 @@ class GuiVLM:
             raise ManoError(f"VLM HTTP {exc.code}: {body[:1200]}") from exc
         except urllib.error.URLError as exc:
             raise ManoNetworkError(f"network error calling the VLM: {exc}") from exc
+        self.call_count += 1
+        usage = result.get("usage") or {}
+        self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
+        self.completion_tokens += int(usage.get("completion_tokens") or 0)
+        return result
 
     @staticmethod
     def content(response: dict[str, Any]) -> str:

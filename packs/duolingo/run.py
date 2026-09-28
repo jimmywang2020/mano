@@ -128,6 +128,7 @@ def call_for_action_duo(client: GuiPlus, image: Path, instruction: str):
         except ManoError as exc:
             last_error = exc
             if attempt < 2 and isinstance(exc, ManoNetworkError):
+                client.retries += 1
                 time.sleep(2**attempt)
                 continue
             raise
@@ -152,6 +153,7 @@ def call_for_action_duo(client: GuiPlus, image: Path, instruction: str):
                     },
                 ]
             )
+            client.retries += 1
             continue
         return text, action, response
     raise ManoError(f"VLM 连续 3 次返回无法解析的动作: {last_error}")
@@ -164,6 +166,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     adb = Adb(serial)
     _ensure_adb_ready(adb, serial)
     client = GuiPlus()
+    wall_start = time.time()
     run_dir = Path(args.output).resolve() / f"duo-{_now_id()}"
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "environment.json").write_text(
@@ -307,6 +310,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             break
 
     jsonl.close()
+    prompt_tokens = client.prompt_tokens
+    completion_tokens = client.completion_tokens
+    price_in = float(os.getenv("MANO_PRICE_IN_PER_1K", "0") or 0)
+    price_out = float(os.getenv("MANO_PRICE_OUT_PER_1K", "0") or 0)
+    est_cost = round(prompt_tokens / 1000 * price_in + completion_tokens / 1000 * price_out, 6)
+    wall_seconds = round(time.time() - wall_start, 1)
     (run_dir / "summary.json").write_text(
         json.dumps(
             {
@@ -314,6 +323,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "total_steps": step,
                 "model": client.model,
                 "endpoint": client.endpoint,
+                "vlm_calls": client.call_count,
+                "retries": client.retries,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "est_cost": est_cost,
+                "wall_seconds": wall_seconds,
                 "run_dir": str(run_dir),
             },
             ensure_ascii=False,
@@ -321,7 +337,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         ),
         encoding="utf-8",
     )
-    print(f"RESULT={result} steps={step} run_dir={run_dir}")
+    print(
+        f"RESULT={result} steps={step} vlm_calls={client.call_count} "
+        f"tokens={prompt_tokens + completion_tokens} retries={client.retries} "
+        f"sec={wall_seconds} cost={est_cost} run_dir={run_dir}"
+    )
     return 0
 
 
