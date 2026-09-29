@@ -12,6 +12,15 @@ engine.
 > Status: early spike (v0.1). The engine is generic; the first pack drives one
 > Duolingo basic lesson end-to-end on an Android emulator.
 
+## Demo
+
+![mano driving one Duolingo lesson](docs/demo.gif)
+
+▶️ **[Watch the full screen recording (MP4)](REPLACE_ME_WITH_UPLOADED_MP4_URL)**
+<!-- Upload mano-demo.mp4 via a GitHub issue/comment (drag-and-drop), copy the
+     generated https://github.com/user-attachments/assets/... link, and replace
+     the URL above. Do NOT commit the .mp4 into the repo. -->
+
 ## Why "engine + packs" instead of a zero-shot agent
 
 A GUI VLM can already look at almost any unseen screen and propose a plausible
