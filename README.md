@@ -16,10 +16,7 @@ engine.
 
 ![mano driving one Duolingo lesson](docs/demo.gif)
 
-▶️ **[Watch the full screen recording (MP4)](REPLACE_ME_WITH_UPLOADED_MP4_URL)**
-<!-- Upload mano-demo.mp4 via a GitHub issue/comment (drag-and-drop), copy the
-     generated https://github.com/user-attachments/assets/... link, and replace
-     the URL above. Do NOT commit the .mp4 into the repo. -->
+▶️ **[Watch the full screen recording (MP4)](https://github.com/user-attachments/assets/9922bee1-aead-42dd-bee1-ec60f5ba30c1)**
 
 ## Why "engine + packs" instead of a zero-shot agent
 
