@@ -76,3 +76,35 @@ measuring generalization, keep a **held-out set** of apps/tasks where no
 app-specific code is allowed, and report zero-prep completion rate, step
 efficiency, repeat/wait-stall rates, safety-guard triggers, and the human
 effort needed to onboard a new app.
+
+## 7. Thin runner (`mano/runner.py`) and observation boundaries
+
+The thin runner is the app-agnostic alternative to copying `run.py`: it takes a
+`Pack` (see `mano/pack.py`) and drives the same one-observation → one-action
+loop. Two reliability mechanisms matter when integrating it:
+
+- **Bounded, coherent observation** (`mano/observation.py`): screenshot + XML +
+  foreground are captured close together and stability-checked (a *sandwich*
+  `XML-before → screenshot → XML-after`, plus a `skew_ms` time bound). The model
+  and the Pack guard always share **one** bundle, so they never decide on two
+  different realities. External consumers should call `capture_observation()`
+  and `propose_action()` instead of copying their own screenshot/ui_dump/VLM
+  code, so the freshness guarantees apply to them too.
+- **Execution freshness**: before any device-modifying action the runner
+  re-observes (`recheck_before_execute`) and, if the foreground or XML
+  fingerprint changed, **discards the stale action and re-observes** rather than
+  executing it. `wait` is non-device-modifying — it is never gated and never
+  counted in `actions_executed`. An optional `approve(action, observation)` hook
+  can veto a final action (fail-closed on `False`/exception).
+
+**Boundary / non-goal (0.x).** This freshness gate is a *generic* XML-fingerprint
++ foreground check; it is **not** the final Pack `resolve/verify` ABI. It can
+only veto an action, not rewrite it. Packs that need to deterministically
+*rewrite* a model action (e.g. remap `wait` to a concrete control, snap a bad
+coordinate to the right widget) still require a future resolver hook — the thin
+runner does not provide that yet, and shipping it does not claim a completed
+migration for such packs. The Core also does not detect constant cross-modal
+semantic contradictions (XML forever "result" while the PNG is forever
+"loading"); catching that would require visual semantics in the Core, which is
+out of scope.
+

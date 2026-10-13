@@ -112,9 +112,10 @@ def test_one_action_one_execute_and_reobserve(tmp_path, monkeypatch):
     assert res.vlm_calls == 3
     assert res.prompt_tokens == 30
     assert res.completion_tokens == 15
-    # one observation per step, exactly one tap per non-terminal step
+    # one bounded observation per step (sandwich = 2 ui_dumps) + a freshness
+    # recheck (1 ui_dump) before each device action; exactly one tap per step
     assert adb.screenshot_calls == 3
-    assert adb.ui_dump_calls == 3
+    assert adb.ui_dump_calls == 8
     assert adb.tap_calls == 2
 
 
@@ -155,7 +156,8 @@ def test_wait_guard_blocks(tmp_path, monkeypatch):
 
     assert res.result == "wait_stuck"
     assert res.total_steps == 4
-    assert res.actions_executed == 3
+    # wait is non-device-modifying: executed but never counted in actions_executed
+    assert res.actions_executed == 0
     assert adb.tap_calls == 0
 
 

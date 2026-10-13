@@ -19,14 +19,21 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 
 from .action_codec import action_signature, mapped_action, parse_tool_call
 from .adb_executor import Adb, execute_action
 from .errors import ManoError, ManoNetworkError
 from .media import image_data_url
+from .observation import Observation, capture_observation, recheck_before_execute
 
 
 _HISTORY_KEYS = ("action", "coordinate", "coordinate2", "text", "status", "button")
+
+# Actions that do not change device state: no fresh re-observation, no consumer
+# approval, and never counted in actions_executed. Everything else is treated as
+# device-modifying. (terminate is handled before this point.)
+_NON_DEVICE_ACTIONS = frozenset({"wait"})
 
 
 @dataclass
@@ -42,6 +49,7 @@ class RunResult:
     completion_tokens: int
     wall_seconds: float
     run_dir: str
+    reobserves: int = 0
 
 
 def _compact(action: dict) -> dict:
@@ -113,9 +121,14 @@ def _capture_frame(adb: Adb, shot: Path) -> tuple[int, int]:
     raise ManoError(f"screenshot failed; ADB connection may be down: {detail}")
 
 
-def _call_for_action(client, image: Path, system_prompt: str, instruction: str):
+def propose_action(client, image: Path, system_prompt: str, instruction: str):
     """Single VLM step: assemble messages, keep 3 parse self-corrections and a
-    network-error exponential backoff. Returns ``(raw_text, action)``."""
+    network-error exponential backoff. Returns ``(raw_text, action)``.
+
+    Public proposal entry point so external consumers can reuse the exact VLM
+    assembly instead of copying it; ``_call_for_action`` stays as a private
+    backward-compatible alias.
+    """
     messages = [
         {"role": "system", "content": system_prompt},
         {
@@ -165,6 +178,18 @@ def _call_for_action(client, image: Path, system_prompt: str, instruction: str):
     raise ManoError(f"VLM returned an unparseable action 3 times in a row: {last_error}")
 
 
+# Backward-compatible private alias (external adapters should migrate to propose_action).
+_call_for_action = propose_action
+
+
+def _safe_approve(approve, action: dict, observation: Observation) -> bool:
+    """Call the consumer veto hook, failing closed on any exception."""
+    try:
+        return bool(approve(action, observation))
+    except Exception:
+        return False
+
+
 def run(
     adb: Adb,
     client,
@@ -174,8 +199,21 @@ def run(
     max_steps: int = 40,
     step_timeout_s: int = 900,
     settle_s: float = 1.0,
+    capture_settle_s: float = 0.4,
+    max_skew_ms: int = 4000,
+    max_unstable: int = 3,
+    max_reobserve: int = 3,
+    approve: Optional[Callable[[dict, Observation], bool]] = None,
 ) -> RunResult:
-    """Drive one run: one action per step, re-observe after every execution."""
+    """Drive one run: one action per step, re-observe after every execution.
+
+    Each step takes a bounded, coherent Observation (screenshot + XML + foreground
+    captured close together and checked for stability); the model and the Pack
+    guard share that single bundle. Before any device-modifying action the loop
+    re-observes and, if the foreground or XML changed, discards the stale action
+    and re-observes instead of executing it. ``wait`` is non-device-modifying: it
+    is never gated by ``approve`` and never counted in ``actions_executed``.
+    """
     ensure_adb_ready(adb)
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -191,9 +229,12 @@ def run(
     repeat = 0
     recent_loop: deque = deque(maxlen=6)
     wait_streak = 0
+    unstable_streak = 0
+    reobserve_streak = 0
     result = "max_steps"
     step = 0
     actions_executed = 0
+    reobserves = 0
     deadline = time.monotonic() + step_timeout_s
 
     for step in range(1, max_steps + 1):
@@ -201,29 +242,40 @@ def run(
             result = "timeout"
             break
 
-        shot = run_dir / f"step-{step:02d}.png"
-        width, height = _capture_frame(adb, shot)
-        xml = adb.ui_dump().decode("utf-8", errors="replace")
-        (run_dir / f"step-{step:02d}.xml").write_text(xml, encoding="utf-8")
+        obs = capture_observation(
+            adb,
+            run_dir,
+            step,
+            capture_frame=_capture_frame,
+            settle_s=capture_settle_s,
+            max_skew_ms=max_skew_ms,
+        )
+        if obs.stability != "stable":
+            unstable_streak += 1
+            log({"step": step, "observation": obs.to_log(), "note": "observation_unstable"})
+            if unstable_streak >= max_unstable:
+                result = "observation_unstable"
+                break
+            continue
+        unstable_streak = 0
 
         # Pack decides whether to stop; the returned reason is the run result.
-        foreground = adb.foreground_package()
-        stop = pack.guard(xml, foreground)
+        stop = pack.guard(obs.xml, obs.foreground)
         if stop is not None:
-            log({"step": step, "screenshot": shot.name, "guard": stop, "foreground": foreground})
+            log({"step": step, "observation": obs.to_log(), "guard": stop, "foreground": obs.foreground})
             result = stop
             break
 
-        system_prompt = pack.system_prompt(width, height)
+        system_prompt = pack.system_prompt(obs.width, obs.height)
         instruction = pack.instruction(history)
         try:
-            text, action = _call_for_action(client, shot, system_prompt, instruction)
+            text, action = propose_action(client, run_dir / obs.screenshot, system_prompt, instruction)
         except ManoError as exc:
-            log({"step": step, "screenshot": shot.name, "vlm_error": str(exc)[:500]})
+            log({"step": step, "observation": obs.to_log(), "vlm_error": str(exc)[:500]})
             result = "vlm_error" if isinstance(exc, ManoNetworkError) else "vlm_unparseable"
             break
 
-        sig = action_signature(action, width, height)
+        sig = action_signature(action, obs.width, obs.height)
         blocked_repeat = sig is not None and sig == last_sig and (repeat + 1) >= 2
         loop_sig = _loop_sig(action)
         recent_loop.append(loop_sig)
@@ -237,19 +289,25 @@ def run(
 
         record = {
             "step": step,
-            "screenshot": shot.name,
-            "xml": f"step-{step:02d}.xml",
+            "screenshot": obs.screenshot,
+            "xml": obs.xml_path,
+            "proposal_observation_id": obs.observation_id,
+            "observation": obs.to_log(),
             "vlm_raw": text,
             "proposed_action": action,
-            "mapped_action": mapped_action(action, width, height),
+            "mapped_action": mapped_action(action, obs.width, obs.height),
             "executed": False,
             "exec_error": None,
             "blocked_repeat": blocked_repeat,
             "oscillating": oscillating,
+            "execution_observation_id": None,
+            "approve_result": None,
             "note": "",
         }
 
-        if action.get("action") == "terminate":
+        act = action.get("action")
+
+        if act == "terminate":
             record["executed"] = True
             log(record)
             result = f"terminate_{action.get('status')}"
@@ -261,15 +319,58 @@ def run(
             result = "oscillation_blocked" if (oscillating and not blocked_repeat) else "repeat_click_blocked"
             break
 
-        wait_streak = wait_streak + 1 if action.get("action") == "wait" else 0
+        wait_streak = wait_streak + 1 if act == "wait" else 0
         if wait_streak >= 4:
             record["note"] = "too_many_waits"
             log(record)
             result = "wait_stuck"
             break
 
+        if act in _NON_DEVICE_ACTIONS:
+            # Non-device-modifying: no fresh re-observe, no approval, not counted.
+            try:
+                execute_action(adb, action, obs.width, obs.height)
+                record["executed"] = True
+            except ManoError as exc:
+                record["exec_error"] = str(exc)[:500]
+                log(record)
+                result = "exec_refused"
+                break
+            log(record)
+            history.append(_compact(action))
+            repeat = repeat + 1 if (sig is not None and sig == last_sig) else 0
+            last_sig = sig
+            continue
+
+        # Device-modifying: re-observe just before executing and veto a stale action.
+        exec_obs = recheck_before_execute(adb, obs, step)
+        record["execution_observation_id"] = exec_obs.observation_id
+        changed = (
+            exec_obs.foreground != obs.foreground
+            or exec_obs.xml_fingerprint != obs.xml_fingerprint
+        )
+        if changed:
+            reobserve_streak += 1
+            reobserves += 1
+            record["note"] = "reobserve_required"
+            log(record)
+            if reobserve_streak >= max_reobserve:
+                result = "reobserve_required"
+                break
+            continue
+        reobserve_streak = 0
+
+        if approve is not None:
+            ok = _safe_approve(approve, action, exec_obs)
+            record["approve_result"] = ok
+            if not ok:
+                record["note"] = "approve_rejected"
+                log(record)
+                result = "approve_rejected"
+                break
+
         try:
-            done = execute_action(adb, action, width, height)
+            done = execute_action(adb, action, obs.width, obs.height)
             record["executed"] = True
             actions_executed += 1
         except ManoError as exc:
@@ -298,4 +399,5 @@ def run(
         completion_tokens=client.completion_tokens,
         wall_seconds=round(time.time() - wall_start, 1),
         run_dir=str(run_dir),
+        reobserves=reobserves,
     )
