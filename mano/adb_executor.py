@@ -101,6 +101,16 @@ class Adb:
         assert last_error is not None
         raise last_error
 
+    def foreground_package(self) -> str:
+        """Return the current foreground app's package name, or '' if unknown."""
+        out = self.shell("dumpsys", "window")
+        for line in out.splitlines():
+            if "mCurrentFocus" in line or "mResumedActivity" in line:
+                match = re.search(r"([A-Za-z0-9_.]+)/[A-Za-z0-9_.]+", line)
+                if match:
+                    return match.group(1)
+        return ""
+
 
 def execute_action(
     adb: Adb, action: dict[str, object], width: int, height: int
