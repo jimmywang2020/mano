@@ -1,25 +1,32 @@
-"""Bounded, coherent device observation shared by the runner and external consumers.
+"""Bounded device observation shared by the runner and external consumers.
 
-ADB cannot capture a screenshot and the UI tree atomically: ``uiautomator dump``
-is slow, so a naive ``screenshot then ui_dump`` can straddle a page transition and
-hand the model one reality while the Pack guard sees another. This module captures
-a *bounded, coherent* observation instead of claiming an atomic one.
+ADB cannot capture a screenshot and the UI tree atomically: ``screenshot`` and
+``uiautomator dump`` run back to back, so the two can straddle a page transition
+(e.g. the PNG still shows a loading spinner while the XML is already the result
+page). This module captures a *bounded* observation and is honest that it is
+**not** an atomic snapshot: it never claims the screenshot and the XML are the
+same instant, and it does not try to detect cross-modal content contradictions
+(that would need visual semantics in the Core, which is out of scope). Deciding
+whether a page is "ready" is the model's / Pack's job, not the Core's.
 
-Stability is generic and carries no app semantics (it does not know what a
-"loading spinner" or a "result page" looks like). Two complementary checks:
+Generic validity carries no app semantics. Capture order per attempt:
 
-  a) primary consistency (sandwich): ``XML-before -> screenshot -> XML-after``;
-     the observation is stable only when the foreground package is unchanged
-     across the window AND both XML fingerprints are identical, i.e. the
-     screenshot was bracketed by a still page.
-  b) time safety bound: the whole capture span (``skew_ms``) must stay under a
-     configurable ceiling. On MuMu the real idle span is ~4.3-4.8s, so the
-     default is 6000ms; 4000ms deterministically false-kills. Tune per platform.
+    foreground_before -> screenshot -> XML -> foreground_after
 
-A mismatch only costs one extra re-capture, so false "unstable" fails safe. A
-constant cross-modal contradiction (XML forever "result", PNG forever "loading")
-is explicitly NOT a 0.x guarantee: detecting it would require visual semantics in
-the Core, which is out of scope.
+An observation is usable only when:
+  * the screenshot succeeded;
+  * the XML dump succeeded;
+  * the foreground package did not change across the window
+    (``foreground_before == foreground_after``); and
+  * the whole capture span (``skew_ms``) stayed under a configurable ceiling.
+    On MuMu the real idle span is ~4.3-4.8s, so the default is 6000ms; 4000ms
+    deterministically false-kills. Tune per platform.
+
+The raw XML fingerprint is recorded as diagnostic evidence but does **not**
+gate generic stability: unrelated dynamic nodes (carousels, timers) change the
+XML constantly and must not be mistaken for an unstable page. A foreground
+change or an over-budget span costs one extra re-capture, so false "unstable"
+fails safe.
 """
 
 from __future__ import annotations
@@ -39,6 +46,13 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _mono_ms() -> int:
+    """Monotonic milliseconds for *duration* math (skew). Never goes backwards on
+    an NTP step, so a system clock adjustment cannot forge a negative/huge span.
+    Module-level so tests can inject a fake monotonic clock."""
+    return time.monotonic_ns() // 1_000_000
+
+
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
@@ -49,7 +63,7 @@ def xml_fingerprint(xml: str) -> str:
 
 @dataclass
 class Observation:
-    """One bounded, coherent view of the device at a point in the run."""
+    """One bounded view of the device at a point in the run (not an atomic snapshot)."""
 
     observation_id: str
     step: int
@@ -60,19 +74,15 @@ class Observation:
     foreground: str  # authoritative value (== foreground_after)
     foreground_before: str
     foreground_after: str
-    xml: str  # raw after-tree, kept in memory for Pack guards; never written to logs
-    xml_fingerprint: str  # == xml_fingerprint_after
-    xml_fingerprint_before: str
-    xml_fingerprint_after: str
+    xml: str  # raw tree, kept in memory for Pack guards; never written to logs
+    xml_fingerprint: str  # diagnostic evidence only; does not gate stability
     capture_started_at: int
     capture_finished_at: int
     foreground_before_at: int
-    xml_before_started_at: int
-    xml_before_finished_at: int
     screenshot_started_at: int
     screenshot_finished_at: int
-    xml_after_started_at: int
-    xml_after_finished_at: int
+    xml_started_at: int
+    xml_finished_at: int
     foreground_after_at: int
     skew_ms: int
     capture_attempt: int
@@ -89,17 +99,13 @@ class Observation:
             "foreground_before": self.foreground_before,
             "foreground_after": self.foreground_after,
             "xml_fingerprint": self.xml_fingerprint,
-            "xml_fingerprint_before": self.xml_fingerprint_before,
-            "xml_fingerprint_after": self.xml_fingerprint_after,
             "capture_started_at": self.capture_started_at,
             "capture_finished_at": self.capture_finished_at,
             "foreground_before_at": self.foreground_before_at,
-            "xml_before_started_at": self.xml_before_started_at,
-            "xml_before_finished_at": self.xml_before_finished_at,
             "screenshot_started_at": self.screenshot_started_at,
             "screenshot_finished_at": self.screenshot_finished_at,
-            "xml_after_started_at": self.xml_after_started_at,
-            "xml_after_finished_at": self.xml_after_finished_at,
+            "xml_started_at": self.xml_started_at,
+            "xml_finished_at": self.xml_finished_at,
             "foreground_after_at": self.foreground_after_at,
             "skew_ms": self.skew_ms,
             "capture_attempt": self.capture_attempt,
@@ -108,14 +114,17 @@ class Observation:
 
 
 @dataclass
-class FreshnessCheck:
+class RevalidationView:
     """A pre-execution re-read of foreground + XML only (no screenshot).
 
     It is deliberately *not* an Observation: it never captures a frame and never
     fabricates a ``screenshot_*`` timestamp. It only answers "did the page move
-    since the proposal?" so the runner can veto a stale action. Foreground is read
-    on *both* sides of the slow ui_dump (``before -> ui_dump -> after``) so a
-    foreground switch during the dump is caught even when the XML looks unchanged.
+    since the proposal?" so the runner (and the Pack's ``verify``) can veto or
+    re-resolve a stale action. Foreground is read on *both* sides of the slow
+    ui_dump (``before -> ui_dump -> after``) so a foreground switch during the
+    dump is caught even when the XML looks unchanged. ``xml_changed`` is evidence
+    only: the Core blocks on a foreground change, but hands a raw-XML change to
+    the Pack's ``verify`` (or the legacy fallback) rather than vetoing blindly.
     """
 
     check_id: str
@@ -164,14 +173,15 @@ def capture_observation(
     settle_s: float = 0.4,
     max_skew_ms: int = DEFAULT_MAX_SKEW_MS,
 ) -> Observation:
-    """Capture a bounded, coherent observation with a sandwich stability check.
+    """Capture a bounded observation with a generic validity check.
 
     ``capture_frame(adb, path) -> (width, height)`` is injected (the runner passes
     its screenshot-with-reconnect helper) so this module stays free of ADB retry
-    policy. On each attempt the screenshot is bracketed by two ui_dumps; the
-    attempt is stable when the foreground is unchanged, both XML fingerprints
-    match, and the span stays within ``max_skew_ms``. After ``max_attempts`` the
-    latest (possibly unstable) view is returned with ``stability == "unstable"``;
+    policy. Order per attempt: ``foreground_before -> screenshot -> XML (single
+    dump) -> foreground_after``. The attempt is usable when the foreground is
+    unchanged across the window and the span stays within ``max_skew_ms``; the raw
+    XML fingerprint is recorded but does not gate stability. After ``max_attempts``
+    the latest (possibly unstable) view is returned with ``stability == "unstable"``;
     the caller must not drive the model or execute a device action on it.
     """
     run_dir = Path(run_dir)
@@ -180,46 +190,38 @@ def capture_observation(
 
     width = height = 0
     xml = ""
-    fp_before = fp_after = ""
+    fp = ""
     fg_before = fg_after = ""
     capture_started_at = capture_finished_at = 0
     fg_before_at = fg_after_at = 0
-    xml_before_started_at = xml_before_finished_at = 0
     screenshot_started_at = screenshot_finished_at = 0
-    xml_after_started_at = xml_after_finished_at = 0
+    xml_started_at = xml_finished_at = 0
     skew_ms = 0
     stability = "unstable"
     attempt = 0
 
     for attempt in range(1, max_attempts + 1):
+        mono_started = _mono_ms()
         capture_started_at = _now_ms()
         fg_before = adb.foreground_package()
         fg_before_at = _now_ms()
-
-        xml_before_started_at = _now_ms()
-        xml_before = adb.ui_dump().decode("utf-8", errors="replace")
-        xml_before_finished_at = _now_ms()
 
         screenshot_started_at = _now_ms()
         width, height = capture_frame(adb, shot)
         screenshot_finished_at = _now_ms()
 
-        xml_after_started_at = _now_ms()
-        xml_after = adb.ui_dump().decode("utf-8", errors="replace")
-        xml_after_finished_at = _now_ms()
+        xml_started_at = _now_ms()
+        xml = adb.ui_dump().decode("utf-8", errors="replace")
+        xml_finished_at = _now_ms()
 
         fg_after = adb.foreground_package()
         fg_after_at = _now_ms()
         capture_finished_at = fg_after_at
 
-        xml = xml_after
-        fp_before = xml_fingerprint(xml_before)
-        fp_after = xml_fingerprint(xml_after)
-        skew_ms = capture_finished_at - capture_started_at
-        coherent = (
-            fg_before == fg_after and fp_before == fp_after and skew_ms <= max_skew_ms
-        )
-        if coherent:
+        fp = xml_fingerprint(xml)
+        skew_ms = _mono_ms() - mono_started  # duration via monotonic, not wall-clock
+        valid = fg_before == fg_after and skew_ms <= max_skew_ms
+        if valid:
             stability = "stable"
             break
         stability = "unstable"
@@ -238,18 +240,14 @@ def capture_observation(
         foreground_before=fg_before,
         foreground_after=fg_after,
         xml=xml,
-        xml_fingerprint=fp_after,
-        xml_fingerprint_before=fp_before,
-        xml_fingerprint_after=fp_after,
+        xml_fingerprint=fp,
         capture_started_at=capture_started_at,
         capture_finished_at=capture_finished_at,
         foreground_before_at=fg_before_at,
-        xml_before_started_at=xml_before_started_at,
-        xml_before_finished_at=xml_before_finished_at,
         screenshot_started_at=screenshot_started_at,
         screenshot_finished_at=screenshot_finished_at,
-        xml_after_started_at=xml_after_started_at,
-        xml_after_finished_at=xml_after_finished_at,
+        xml_started_at=xml_started_at,
+        xml_finished_at=xml_finished_at,
         foreground_after_at=fg_after_at,
         skew_ms=skew_ms,
         capture_attempt=attempt,
@@ -257,13 +255,15 @@ def capture_observation(
     )
 
 
-def check_freshness(adb, proposal: Observation, step: int) -> FreshnessCheck:
+def capture_revalidation(adb, proposal: Observation, step: int) -> RevalidationView:
     """Re-read foreground + XML just before executing and report whether the page
     moved since ``proposal``. Takes no screenshot and fabricates no frame time.
 
     Foreground is sampled on both sides of the slow ui_dump; a switch to another
     app during the dump makes ``foreground_changed`` true even if the XML is
-    byte-identical, so we never tap into the wrong foreground.
+    byte-identical, so we never tap into the wrong foreground. ``xml_changed`` is
+    evidence only: the caller decides (via Pack.verify or the legacy fallback)
+    whether a raw-XML change actually invalidates the approved action.
     """
     started = _now_ms()
     foreground_before = adb.foreground_package()
@@ -277,7 +277,7 @@ def check_freshness(adb, proposal: Observation, step: int) -> FreshnessCheck:
         foreground_before != proposal.foreground or foreground_after != proposal.foreground
     )
     xml_changed = fp != proposal.xml_fingerprint
-    return FreshnessCheck(
+    return RevalidationView(
         check_id=_new_id(),
         step=step,
         foreground_before=foreground_before,
@@ -295,3 +295,9 @@ def check_freshness(adb, proposal: Observation, step: int) -> FreshnessCheck:
         changed=foreground_changed or xml_changed,
         xml=xml,
     )
+
+
+# Deprecated aliases kept only for external adapters mid-migration; new code and
+# docs use RevalidationView / capture_revalidation exclusively.
+FreshnessCheck = RevalidationView
+check_freshness = capture_revalidation

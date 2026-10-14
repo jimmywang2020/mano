@@ -14,7 +14,7 @@ from pathlib import Path
 from shutil import which
 
 from .errors import ManoError
-from .action_codec import int_coord
+from .action_codec import KEYEVENT_CODES, TYPE_TEXT_RE, int_coord, validate_action
 from .media import png_size
 
 
@@ -76,13 +76,12 @@ class Adb:
         )
 
     def type_text(self, text: str) -> None:
-        if not re.fullmatch(r"[A-Za-z0-9 +._-]{1,80}", text):
+        if TYPE_TEXT_RE.fullmatch(text) is None:
             raise ManoError(f"refusing non-whitelisted text input: {text!r}")
         self.shell("input", "text", text.replace(" ", "%s"))
 
     def keyevent(self, value: str) -> None:
-        allowed = {"BACK": "4", "HOME": "3", "ENTER": "66", "CLEAR": "28"}
-        key = allowed.get(value.upper())
+        key = KEYEVENT_CODES.get(value.upper())
         if key is None:
             raise ManoError(f"refusing non-whitelisted keyevent: {value}")
         self.shell("input", "keyevent", key)
@@ -115,7 +114,15 @@ class Adb:
 def execute_action(
     adb: Adb, action: dict[str, object], width: int, height: int
 ) -> bool:
-    """Execute one already-resolved, policy-approved action. Returns True on terminate."""
+    """Execute one already-resolved, policy-approved action. Returns True on terminate.
+
+    Defense in depth: the runner validates Pack output before approve/verify, but
+    the executor re-validates against the same single source of truth so no caller
+    can drive the device with an action the whitelist would reject.
+    """
+    invalid = validate_action(action)
+    if invalid is not None:
+        raise ManoError(f"refusing invalid action [{invalid}]: {action!r}")
     kind = str(action.get("action", ""))
     if kind == "click":
         adb.tap(*int_coord(action.get("coordinate"), width, height))

@@ -21,7 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .action_codec import action_signature, mapped_action, parse_tool_call
+from .action_codec import (
+    action_signature,
+    execution_payload,
+    mapped_action,
+    parse_tool_call,
+    semantic_signature,
+    validate_action,
+)
 from .adb_executor import Adb, execute_action
 from .errors import ManoError, ManoNetworkError
 from .media import image_data_url
@@ -29,16 +36,18 @@ from .observation import (
     DEFAULT_MAX_SKEW_MS,
     Observation,
     capture_observation,
-    check_freshness,
+    capture_revalidation,
 )
+from .pack import ALLOW, BLOCK, REOBSERVE, ResolveDecision, ResolvedAction, VerificationResult
 
 
 _HISTORY_KEYS = ("action", "coordinate", "coordinate2", "text", "status", "button")
 
 # Actions that do not change device state: no fresh re-observation, no consumer
 # approval, and never counted in actions_executed. Everything else is treated as
-# device-modifying. (terminate is handled before this point.)
+# device-modifying. (terminate is handled after resolve, before this classification.)
 _NON_DEVICE_ACTIONS = frozenset({"wait"})
+
 
 
 @dataclass
@@ -59,21 +68,6 @@ class RunResult:
 
 def _compact(action: dict) -> dict:
     return {key: action[key] for key in _HISTORY_KEYS if key in action}
-
-
-def _loop_sig(action: dict) -> tuple | None:
-    """Coarse grid signature over the normalized 0-1000 coordinate, used only to
-    catch A-B-A-B oscillation the exact-coordinate repeat guard misses (a tapped
-    target drifts a few pixels, so exact signatures never match)."""
-    if action.get("action") != "click":
-        return None
-    coord = action.get("coordinate")
-    if not isinstance(coord, list) or len(coord) != 2:
-        return None
-    try:
-        return ("click", round(float(coord[0]) / 40), round(float(coord[1]) / 40))
-    except (TypeError, ValueError):
-        return None
 
 
 def _is_local_tcp_serial(serial: str) -> bool:
@@ -187,12 +181,50 @@ def propose_action(client, image: Path, system_prompt: str, instruction: str):
 _call_for_action = propose_action
 
 
-def _safe_approve(approve, action: dict, observation: Observation) -> bool:
-    """Call the consumer veto hook, failing closed on any exception."""
+def _safe_approve(approve, resolved: ResolvedAction, observation: Observation) -> bool:
+    """Call the consumer veto hook with the resolved semantic action, failing
+    closed on any exception."""
     try:
-        return bool(approve(action, observation))
+        return bool(approve(resolved, observation))
     except Exception:
         return False
+
+
+def _safe_resolve(pack, action: dict, observation: Observation, model_text: str) -> ResolveDecision:
+    """Call Pack.resolve, failing closed (BLOCK) on any exception."""
+    try:
+        decision = pack.resolve(
+            proposed_action=action, observation=observation, model_text=model_text
+        )
+    except Exception as exc:  # a pack bug must not drive the device
+        return ResolveDecision(
+            verdict=BLOCK,
+            semantic_target="",
+            resolved_action=dict(action),
+            reason="resolve_error",
+            metadata={"error": str(exc)[:500]},
+        )
+    if not isinstance(decision, ResolveDecision):
+        return ResolveDecision(
+            verdict=BLOCK,
+            semantic_target="",
+            resolved_action=dict(action),
+            reason="resolve_error",
+            metadata={"error": "resolve did not return a ResolveDecision"},
+        )
+    return decision
+
+
+def _safe_verify(verify, approved_intent: str, fresh_view) -> VerificationResult:
+    """Call Pack.verify, failing closed (BLOCK) on any exception."""
+    try:
+        verification = verify(approved_intent=approved_intent, fresh_observation=fresh_view)
+    except Exception as exc:
+        return VerificationResult(verdict=BLOCK, reason="verify_error", metadata={"error": str(exc)[:500]})
+    if not isinstance(verification, VerificationResult):
+        return VerificationResult(verdict=BLOCK, reason="verify_error")
+    return verification
+
 
 
 def run(
@@ -208,19 +240,26 @@ def run(
     max_skew_ms: int = DEFAULT_MAX_SKEW_MS,
     max_unstable: int = 3,
     max_reobserve: int = 3,
-    approve: Optional[Callable[[dict, Observation], bool]] = None,
+    approve: Optional[Callable[[ResolvedAction, Observation], bool]] = None,
 ) -> RunResult:
     """Drive one run: one action per step, re-observe after every execution.
 
-    Each step takes a bounded, coherent Observation (screenshot + XML + foreground
-    captured close together and checked for stability); the model and the Pack
-    guard share that single bundle. For a device-modifying action the order is
-    ``stable proposal -> approve -> final freshness check -> execute``: the
-    consumer approves the proposed action against the stable proposal observation,
-    then a final ``FreshnessCheck`` catches any UI/foreground drift during that
-    confirmation and, if the page moved, discards the action with zero ADB input
-    and re-observes. ``wait`` is non-device-modifying: never gated by ``approve``
-    and never counted in ``actions_executed``.
+    Each step takes a bounded Observation (screenshot + XML + foreground captured
+    close together, foreground-stable and within a time bound -- but NOT an atomic
+    snapshot and NOT gated on raw-XML equality). The model and the Pack guard share
+    that single bundle. The raw model action is then resolved by the Pack into a
+    stable ``semantic_target`` + a physical action; classification and all guards
+    run on the *resolved* action (a model ``wait`` may resolve to a device click).
+
+    For a device-modifying resolved action the order is
+    ``resolve -> classify -> approve(ResolvedAction) -> RevalidationView ->
+    Core foreground check -> Pack.verify (or legacy raw-XML fallback) -> execute``:
+    the consumer approves the semantic action, a revalidation re-reads foreground
+    (sandwiched around the ui_dump) + XML, a foreground change fails closed with
+    zero ADB, and the Pack re-verifies the same target on the latest page (it may
+    re-resolve coordinates but never the target or side-effect fields -- the Core
+    enforces that). ``wait`` resolved actions are non-device-modifying: never gated
+    by ``approve`` and never counted in ``actions_executed``.
     """
     ensure_adb_ready(adb)
     run_dir = Path(run_dir)
@@ -233,7 +272,7 @@ def run(
         jsonl.flush()
 
     history: list[dict] = []
-    last_sig: tuple | None = None
+    last_sem_sig: tuple | None = None
     repeat = 0
     recent_loop: deque = deque(maxlen=6)
     wait_streak = 0
@@ -283,17 +322,10 @@ def run(
             result = "vlm_error" if isinstance(exc, ManoNetworkError) else "vlm_unparseable"
             break
 
-        sig = action_signature(action, obs.width, obs.height)
-        blocked_repeat = sig is not None and sig == last_sig and (repeat + 1) >= 2
-        loop_sig = _loop_sig(action)
-        recent_loop.append(loop_sig)
-        oscillating = (
-            loop_sig is not None
-            and len(recent_loop) >= 4
-            and recent_loop[-1] == recent_loop[-3]
-            and recent_loop[-2] == recent_loop[-4]
-            and recent_loop[-1] != recent_loop[-2]
-        )
+        # Pack resolves the raw model action into a stable semantic target + a
+        # physical action. Classification and ALL guards run on the resolved action.
+        decision = _safe_resolve(pack, action, obs, text)
+        resolved = decision.resolved_action if isinstance(decision.resolved_action, dict) else {}
 
         record = {
             "step": step,
@@ -303,22 +335,79 @@ def run(
             "observation": obs.to_log(),
             "vlm_raw": text,
             "proposed_action": action,
-            "mapped_action": mapped_action(action, obs.width, obs.height),
+            "resolve_verdict": decision.verdict,
+            "semantic_target": decision.semantic_target,
+            "resolved_action": resolved,
+            "resolve_reason": decision.reason,
+            "mapped_action": None,
+            "physical_signature": None,
+            "semantic_signature": None,
+            "approve_result": None,
+            "execution_check": None,
+            "verification_mode": None,
+            "verify_verdict": None,
+            "verify_reason": "",
+            "final_resolved_action": None,
             "executed": False,
             "exec_error": None,
-            "blocked_repeat": blocked_repeat,
-            "oscillating": oscillating,
-            "execution_check": None,
-            "approve_result": None,
+            "blocked_repeat": False,
+            "oscillating": False,
             "note": "",
         }
 
-        act = action.get("action")
+        # Resolve verdict gate (before validation / classification): the Pack may
+        # refuse or ask to re-observe before the Core commits to any action.
+        if decision.verdict == BLOCK:
+            record["note"] = "resolve_blocked"
+            log(record)
+            result = decision.reason or "resolve_blocked"
+            break
+        if decision.verdict == REOBSERVE:
+            reobserve_streak += 1
+            reobserves += 1
+            record["note"] = "reobserve_required"
+            log(record)
+            if reobserve_streak >= max_reobserve:
+                result = "reobserve_required"
+                break
+            continue
+
+        # ALLOW: Pack output is untrusted input -> validate against the single
+        # whitelist before it can reach signatures / approve / verify / the device.
+        # Fail closed (zero ADB) with a stable error code; never crash the run.
+        invalid = validate_action(resolved)
+        if invalid is not None:
+            record["note"] = "resolve_invalid_action"
+            record["resolve_reason"] = invalid
+            log(record)
+            result = "resolve_invalid_action"
+            break
+
+        act = resolved["action"]
+        record["mapped_action"] = mapped_action(resolved, obs.width, obs.height)
+        phys_sig = action_signature(resolved, obs.width, obs.height)
+        record["physical_signature"] = list(phys_sig) if phys_sig is not None else None
+        sem_sig = semantic_signature(decision.semantic_target, resolved)
+        record["semantic_signature"] = list(sem_sig) if sem_sig is not None else None
+
+        # Anti-loop keys on the SEMANTIC signature (target + side-effects, no
+        # coordinates), so a drifting tap on the same control is still "the same
+        # action". recent_loop holds only successfully executed device actions.
+        blocked_repeat = sem_sig is not None and sem_sig == last_sem_sig and (repeat + 1) >= 2
+        oscillating = (
+            sem_sig is not None
+            and len(recent_loop) >= 3
+            and sem_sig == recent_loop[-2]
+            and recent_loop[-1] == recent_loop[-3]
+            and sem_sig != recent_loop[-1]
+        )
+        record["blocked_repeat"] = blocked_repeat
+        record["oscillating"] = oscillating
 
         if act == "terminate":
             record["executed"] = True
             log(record)
-            result = f"terminate_{action.get('status')}"
+            result = f"terminate_{resolved.get('status')}"
             break
         if blocked_repeat or oscillating:
             if oscillating and not blocked_repeat:
@@ -335,25 +424,30 @@ def run(
             break
 
         if act in _NON_DEVICE_ACTIONS:
-            # Non-device-modifying: no fresh re-observe, no approval, not counted.
+            # Non-device-modifying: no approval, no revalidation, not counted, and
+            # it never enters the device-action history (recent_loop / repeat). A
+            # successful wait does clear the re-observe streak.
             try:
-                execute_action(adb, action, obs.width, obs.height)
+                execute_action(adb, resolved, obs.width, obs.height)
                 record["executed"] = True
             except ManoError as exc:
                 record["exec_error"] = str(exc)[:500]
                 log(record)
                 result = "exec_refused"
                 break
+            reobserve_streak = 0
             log(record)
-            history.append(_compact(action))
-            repeat = repeat + 1 if (sig is not None and sig == last_sig) else 0
-            last_sig = sig
+            history.append(_compact(resolved))
             continue
 
-        # Device-modifying: approve on the stable proposal, then a final freshness
-        # check catches drift during that approval; on any change: zero ADB, re-observe.
+        # Device-modifying: approve(ResolvedAction) -> revalidation -> verify/fallback.
+        approved = ResolvedAction(
+            semantic_target=decision.semantic_target,
+            resolved_action=resolved,
+            metadata=decision.metadata,
+        )
         if approve is not None:
-            ok = _safe_approve(approve, action, obs)
+            ok = _safe_approve(approve, approved, obs)
             record["approve_result"] = ok
             if not ok:
                 record["note"] = "approve_rejected"
@@ -361,9 +455,12 @@ def run(
                 result = "approve_rejected"
                 break
 
-        check = check_freshness(adb, obs, step)
-        record["execution_check"] = check.to_log()
-        if check.changed:
+        reval = capture_revalidation(adb, obs, step)
+        record["execution_check"] = reval.to_log()
+
+        # Core foreground safety boundary (both modes): a foreground switch during
+        # confirmation / ui_dump -> zero ADB, re-observe.
+        if reval.foreground_changed:
             reobserve_streak += 1
             reobserves += 1
             record["note"] = "reobserve_required"
@@ -372,10 +469,64 @@ def run(
                 result = "reobserve_required"
                 break
             continue
-        reobserve_streak = 0
 
+        final = resolved
+        verify = getattr(pack, "verify", None)
+        if callable(verify):
+            record["verification_mode"] = "pack_verify"
+            verification = _safe_verify(verify, decision.semantic_target, reval)
+            record["verify_verdict"] = verification.verdict
+            record["verify_reason"] = verification.reason
+            if verification.verdict == BLOCK:
+                record["note"] = "verify_blocked"
+                log(record)
+                result = verification.reason or "verify_blocked"
+                break
+            if verification.verdict != ALLOW:
+                reobserve_streak += 1
+                reobserves += 1
+                record["note"] = "reobserve_required"
+                log(record)
+                if reobserve_streak >= max_reobserve:
+                    result = "reobserve_required"
+                    break
+                continue
+            candidate = verification.resolved_action
+            # verify output is untrusted too: validate before anti-swap / execute.
+            invalid_verify = validate_action(candidate)
+            if invalid_verify is not None:
+                record["note"] = "verify_invalid_action"
+                record["verify_reason"] = invalid_verify
+                log(record)
+                result = "verify_invalid_action"
+                break
+            # Anti-swap: verify may only re-resolve coordinates. The execution
+            # payload (action type + non-coordinate side-effects) must be identical;
+            # coordinates and metadata are excluded from the comparison.
+            if execution_payload(candidate) != execution_payload(resolved):
+                record["note"] = "verify_semantic_swap_blocked"
+                log(record)
+                result = "verify_semantic_swap_blocked"
+                break
+            final = candidate
+        else:
+            # Legacy fallback (no Pack.verify): foreground already safe; a raw-XML
+            # change means re-observe, otherwise execute the initial resolved action.
+            record["verification_mode"] = "legacy_raw_xml_fallback"
+            if reval.xml_changed:
+                reobserve_streak += 1
+                reobserves += 1
+                record["note"] = "reobserve_required"
+                log(record)
+                if reobserve_streak >= max_reobserve:
+                    result = "reobserve_required"
+                    break
+                continue
+
+        reobserve_streak = 0
+        record["final_resolved_action"] = final
         try:
-            done = execute_action(adb, action, obs.width, obs.height)
+            done = execute_action(adb, final, obs.width, obs.height)
             record["executed"] = True
             actions_executed += 1
         except ManoError as exc:
@@ -385,9 +536,12 @@ def run(
             break
 
         log(record)
-        history.append(_compact(action))
-        repeat = repeat + 1 if (sig is not None and sig == last_sig) else 0
-        last_sig = sig
+        history.append(_compact(final))
+        # Only a successfully executed device action enters the semantic loop
+        # history; REOBSERVE / blocked / failed steps never pollute it.
+        recent_loop.append(sem_sig)
+        repeat = repeat + 1 if (sem_sig is not None and sem_sig == last_sem_sig) else 0
+        last_sem_sig = sem_sig
         time.sleep(settle_s)
         if done:
             result = "terminate_from_exec"

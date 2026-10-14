@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from mano import adb_executor, runner
+from mano.pack import ALLOW, ResolveDecision
 
 
 def _png_header(width: int, height: int) -> bytes:
@@ -93,6 +94,21 @@ class FakePack:
     def guard(self, xml: str, foreground: str | None) -> str | None:
         return self._guard_result
 
+    def resolve(self, *, proposed_action, observation, model_text) -> ResolveDecision:
+        # Passthrough: the thin runner unit tests exercise the generic loop, not
+        # app semantics; the resolved action equals the model action. The semantic
+        # target embeds the proposed coordinate so two different taps stay distinct
+        # even though the semantic signature itself drops coordinates.
+        target = "target:" + str(proposed_action.get("action"))
+        coord = proposed_action.get("coordinate")
+        if isinstance(coord, list) and len(coord) == 2:
+            target += f":{coord[0]},{coord[1]}"
+        return ResolveDecision(
+            verdict=ALLOW,
+            semantic_target=target,
+            resolved_action=dict(proposed_action),
+        )
+
 
 def test_one_action_one_execute_and_reobserve(tmp_path, monkeypatch):
     monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
@@ -112,10 +128,10 @@ def test_one_action_one_execute_and_reobserve(tmp_path, monkeypatch):
     assert res.vlm_calls == 3
     assert res.prompt_tokens == 30
     assert res.completion_tokens == 15
-    # one bounded observation per step (sandwich = 2 ui_dumps) + a freshness
-    # recheck (1 ui_dump) before each device action; exactly one tap per step
+    # one bounded observation per step (single ui_dump) + a revalidation
+    # re-read (1 ui_dump) before each device action; exactly one tap per step
     assert adb.screenshot_calls == 3
-    assert adb.ui_dump_calls == 8
+    assert adb.ui_dump_calls == 5
     assert adb.tap_calls == 2
 
 
