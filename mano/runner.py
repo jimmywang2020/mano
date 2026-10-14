@@ -43,6 +43,10 @@ from .pack import ALLOW, BLOCK, REOBSERVE, ResolveDecision, ResolvedAction, Veri
 
 _HISTORY_KEYS = ("action", "coordinate", "coordinate2", "text", "status", "button")
 
+# The only verdicts resolve()/verify() may return; anything else is a Pack bug
+# and must fail closed (never silently fall through to ALLOW / REOBSERVE).
+_VERDICTS = frozenset({ALLOW, REOBSERVE, BLOCK})
+
 # Actions that do not change device state: no fresh re-observation, no consumer
 # approval, and never counted in actions_executed. Everything else is treated as
 # device-modifying. (terminate is handled after resolve, before this classification.)
@@ -264,7 +268,7 @@ def run(
     ensure_adb_ready(adb)
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    wall_start = time.time()
+    wall_start = time.monotonic()
     jsonl = (run_dir / "steps.jsonl").open("w", encoding="utf-8")
 
     def log(record: dict) -> None:
@@ -356,7 +360,14 @@ def run(
         }
 
         # Resolve verdict gate (before validation / classification): the Pack may
-        # refuse or ask to re-observe before the Core commits to any action.
+        # refuse or ask to re-observe before the Core commits to any action. An
+        # unrecognized verdict is a Pack bug and fails closed (never ALLOW).
+        if decision.verdict not in _VERDICTS:
+            record["note"] = "resolve_blocked"
+            record["resolve_reason"] = "invalid_resolve_verdict"
+            log(record)
+            result = "invalid_resolve_verdict"
+            break
         if decision.verdict == BLOCK:
             record["note"] = "resolve_blocked"
             log(record)
@@ -371,6 +382,14 @@ def run(
                 result = "reobserve_required"
                 break
             continue
+
+        # ALLOW requires a usable semantic identity; BLOCK/REOBSERVE may omit it.
+        if not isinstance(decision.semantic_target, str) or not decision.semantic_target:
+            record["note"] = "resolve_blocked"
+            record["resolve_reason"] = "invalid_semantic_target"
+            log(record)
+            result = "invalid_semantic_target"
+            break
 
         # ALLOW: Pack output is untrusted input -> validate against the single
         # whitelist before it can reach signatures / approve / verify / the device.
@@ -477,12 +496,18 @@ def run(
             verification = _safe_verify(verify, decision.semantic_target, reval)
             record["verify_verdict"] = verification.verdict
             record["verify_reason"] = verification.reason
+            if verification.verdict not in _VERDICTS:
+                record["note"] = "verify_blocked"
+                record["verify_reason"] = "invalid_verify_verdict"
+                log(record)
+                result = "invalid_verify_verdict"
+                break
             if verification.verdict == BLOCK:
                 record["note"] = "verify_blocked"
                 log(record)
                 result = verification.reason or "verify_blocked"
                 break
-            if verification.verdict != ALLOW:
+            if verification.verdict == REOBSERVE:
                 reobserve_streak += 1
                 reobserves += 1
                 record["note"] = "reobserve_required"
@@ -556,7 +581,7 @@ def run(
         retries=client.retries,
         prompt_tokens=client.prompt_tokens,
         completion_tokens=client.completion_tokens,
-        wall_seconds=round(time.time() - wall_start, 1),
+        wall_seconds=round(time.monotonic() - wall_start, 1),
         run_dir=str(run_dir),
         reobserves=reobserves,
     )

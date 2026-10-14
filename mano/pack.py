@@ -1,13 +1,74 @@
 """App-pack protocol for the thin runner.
 
-A Pack only reports *what it sees* and *what to tell the VLM*; it never touches
-ADB, coordinates, or evidence. The runner owns the device, the loop, and the
-reliability guards. This is a 0.x experimental interface, not a frozen ABI.
+A Pack reports *what it sees*, *what to tell the VLM*, and *how to resolve /
+re-verify a semantic action*; it never touches ADB, coordinates it cannot
+justify, or evidence. The runner owns the device, the loop, and the reliability
+guards. This is a 0.x experimental interface, not a frozen ABI.
+
+Responsibility split (see docs/adding-a-pack.md §7):
+  * Core  -- owns observation, the loop order, approval gating, re-observation,
+            the foreground safety boundary, the anti-swap check, and single
+            execution. It never interprets a control.
+  * Pack  -- interprets the app: ``resolve`` turns a raw model action into a
+            stable ``semantic_target`` + a concrete physical action; ``verify``
+            re-checks that the *same* semantic target still holds on the latest
+            page and may re-resolve coordinates (never the target or side-effects).
+  * Consumer -- authorizes the semantic action (business rule); approve/veto only.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
+
+# Verdicts shared by resolve() and verify(). REPLAN is intentionally not used.
+ALLOW = "ALLOW"
+REOBSERVE = "REOBSERVE"
+BLOCK = "BLOCK"
+
+
+@dataclass(frozen=True)
+class ResolvedAction:
+    """A model action resolved to a stable semantic identity + a physical action.
+
+    ``semantic_target`` is an opaque, comparable identity (e.g. ``home.search_field``).
+    The Core never interprets it; it only freezes it, together with the action's
+    non-coordinate side-effect fields, and refuses any later change to them.
+    ``resolved_action`` is the concrete action for the *current* page; only its
+    coordinates may be re-resolved later by ``verify``. ``metadata`` is auditable
+    provenance (matched text, rule id, ...).
+    """
+
+    semantic_target: str
+    resolved_action: dict
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class ResolveDecision:
+    """Result of ``Pack.resolve``: a verdict plus the resolved semantic action."""
+
+    verdict: str  # ALLOW | REOBSERVE | BLOCK
+    semantic_target: str
+    resolved_action: dict
+    reason: str = ""
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class VerificationResult:
+    """Result of ``Pack.verify``: does the approved semantic target still hold?
+
+    On ``ALLOW`` the pack returns a fresh ``resolved_action`` (coordinates may be
+    updated for the latest page). The Core rejects it if any non-coordinate field
+    differs from the approved action. ``REOBSERVE`` means the page is not ready
+    (zero ADB, re-observe); ``BLOCK`` means a safety boundary was hit.
+    """
+
+    verdict: str  # ALLOW | REOBSERVE | BLOCK
+    resolved_action: dict | None = None  # present only on ALLOW
+    reason: str = ""
+    metadata: dict = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -37,3 +98,17 @@ class Pack(Protocol):
         decide whether to stop (e.g. left app, paywall) or keep going.
         """
         ...
+
+    def resolve(
+        self, *, proposed_action: dict, observation, model_text: str
+    ) -> ResolveDecision:
+        """Resolve a raw model action into a stable semantic target + physical
+        action. Required: the runner classifies and gates on the *resolved*
+        action, not the raw model action (a model ``wait`` may resolve to a
+        device-modifying ``click``)."""
+        ...
+
+    # verify(*, approved_intent: str, fresh_observation) -> VerificationResult
+    # is an OPTIONAL capability. A pack without it runs the legacy raw-XML
+    # fallback (foreground/raw-XML change -> REOBSERVE; otherwise execute the
+    # initial resolved action). Real packs must implement verify.

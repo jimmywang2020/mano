@@ -4,7 +4,7 @@ No device, no VLM. Guard result strings must match the baseline run.py results.
 
 from __future__ import annotations
 
-from mano.pack import Pack
+from mano.pack import ALLOW, Pack
 from packs.duolingo.pack import DuolingoPack
 
 
@@ -61,3 +61,24 @@ def test_system_prompt_mentions_resolution():
     text = pack.system_prompt(1080, 1920)
     assert isinstance(text, str)
     assert "1080x1920" in text
+
+
+def _resolve(pack, action):
+    return pack.resolve(proposed_action=action, observation=None, model_text="")
+
+
+def test_legacy_target_distinguishes_swipes_by_endpoint():
+    pack = DuolingoPack()
+    # same start, different end -> must NOT collapse to one legacy identity
+    down = _resolve(pack, {"action": "swipe", "coordinate": [100, 100], "coordinate2": [100, 800]})
+    right = _resolve(pack, {"action": "swipe", "coordinate": [100, 100], "coordinate2": [800, 100]})
+    assert down.semantic_target != right.semantic_target
+
+
+def test_resolve_allow_reason_empty_and_marks_legacy_mode():
+    pack = DuolingoPack()
+    decision = _resolve(pack, {"action": "click", "coordinate": [10, 20]})
+    assert decision.verdict == ALLOW
+    assert decision.reason == ""  # ALLOW carries no error reason
+    assert decision.metadata == {"mode": "legacy_passthrough"}
+    assert decision.resolved_action == {"action": "click", "coordinate": [10, 20]}

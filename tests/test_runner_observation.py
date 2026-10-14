@@ -987,6 +987,94 @@ def test_verify_non_dict_fails_closed(tmp_path, monkeypatch):
     assert _records(tmp_path)[0]["verify_reason"] == "not_a_dict"
 
 
+# Unrecognized verdicts are Pack bugs and must fail closed (never ALLOW/REOBSERVE)
+def test_resolve_unknown_verdict_fails_closed(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    adb = ScriptedAdb()
+
+    def resolve_fn(proposed_action, observation, model_text):
+        return ResolveDecision(
+            verdict="MAYBE",  # not ALLOW / REOBSERVE / BLOCK
+            semantic_target="home.cta",
+            resolved_action={"action": "click", "coordinate": [100, 100]},
+        )
+
+    pack = FakePack(resolve_fn=resolve_fn)
+    client = FakeClient([_tool_call({"action": "click", "coordinate": [100, 100]})])
+    res = runner.run(adb, client, pack, tmp_path, max_steps=5, settle_s=0, capture_settle_s=0)
+
+    assert res.result == "invalid_resolve_verdict"
+    assert adb.tap_calls == 0
+    assert _records(tmp_path)[0]["resolve_reason"] == "invalid_resolve_verdict"
+
+
+def test_resolve_allow_empty_semantic_target_fails_closed(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    adb = ScriptedAdb()
+
+    def resolve_fn(proposed_action, observation, model_text):
+        return ResolveDecision(
+            verdict=ALLOW, semantic_target="", resolved_action={"action": "click", "coordinate": [100, 100]}
+        )
+
+    pack = FakePack(resolve_fn=resolve_fn)
+    client = FakeClient([_tool_call({"action": "click", "coordinate": [100, 100]})])
+    res = runner.run(adb, client, pack, tmp_path, max_steps=5, settle_s=0, capture_settle_s=0)
+
+    assert res.result == "invalid_semantic_target"
+    assert adb.tap_calls == 0
+    assert _records(tmp_path)[0]["resolve_reason"] == "invalid_semantic_target"
+
+
+def test_resolve_allow_non_str_semantic_target_fails_closed(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    adb = ScriptedAdb()
+
+    def resolve_fn(proposed_action, observation, model_text):
+        return ResolveDecision(
+            verdict=ALLOW, semantic_target=123, resolved_action={"action": "click", "coordinate": [100, 100]}
+        )
+
+    pack = FakePack(resolve_fn=resolve_fn)
+    client = FakeClient([_tool_call({"action": "click", "coordinate": [100, 100]})])
+    res = runner.run(adb, client, pack, tmp_path, max_steps=5, settle_s=0, capture_settle_s=0)
+
+    assert res.result == "invalid_semantic_target"
+    assert adb.tap_calls == 0
+    assert _records(tmp_path)[0]["resolve_reason"] == "invalid_semantic_target"
+
+
+def test_verify_unknown_verdict_fails_closed(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    adb = ScriptedAdb()
+
+    def verify(approved_intent, fresh):
+        # a misspelled verdict must NOT be silently read as REOBSERVE
+        return VerificationResult(verdict="PERHAPS", resolved_action={"action": "click", "coordinate": [100, 100]})
+
+    pack = FakePack(resolve_fn=_resolve_click("home.cta", 100, 100), verify_fn=verify)
+    client = FakeClient([_tool_call({"action": "click", "coordinate": [100, 100]})])
+    res = runner.run(adb, client, pack, tmp_path, max_steps=5, settle_s=0, capture_settle_s=0)
+
+    assert res.result == "invalid_verify_verdict"
+    assert adb.tap_calls == 0
+    assert _records(tmp_path)[0]["verify_reason"] == "invalid_verify_verdict"
+
+
+# wall_seconds uses the monotonic clock, so a wall-clock rollback can't forge it
+def test_wall_seconds_uses_monotonic_not_wallclock(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    # wall clock jumps far backwards mid-run; wall_seconds must stay non-negative
+    vals = iter([1_000_000.0])
+    monkeypatch.setattr(runner.time, "time", lambda: next(vals, 0.0))
+    adb = ScriptedAdb()
+    client = FakeClient([_tool_call({"action": "terminate", "status": "success"})])
+    res = runner.run(adb, client, FakePack(), tmp_path, max_steps=5, settle_s=0, capture_settle_s=0)
+
+    assert res.result == "terminate_success"
+    assert res.wall_seconds >= 0.0  # monotonic duration, unaffected by the wall jump
+
+
 # ---------------------------------------------------------------------------
 # action_codec unit tests: single source of truth for the action whitelist.
 # ---------------------------------------------------------------------------
