@@ -90,12 +90,14 @@ loop. Two reliability mechanisms matter when integrating it:
   different realities. External consumers should call `capture_observation()`
   and `propose_action()` instead of copying their own screenshot/ui_dump/VLM
   code, so the freshness guarantees apply to them too.
-- **Execution freshness**: before any device-modifying action the runner
-  re-observes (`recheck_before_execute`) and, if the foreground or XML
-  fingerprint changed, **discards the stale action and re-observes** rather than
-  executing it. `wait` is non-device-modifying — it is never gated and never
-  counted in `actions_executed`. An optional `approve(action, observation)` hook
-  can veto a final action (fail-closed on `False`/exception).
+- **Execution freshness**: for a device-modifying action the order is
+  `stable proposal -> approve -> final freshness check -> execute`. After the
+  (optional) `approve(action, observation)` veto runs against the stable
+  proposal, a final `FreshnessCheck` (`check_freshness`, foreground + XML only,
+  no screenshot) catches any UI/foreground drift during that confirmation; if the
+  page moved the runner **discards the action with zero ADB input and
+  re-observes**. `wait` is non-device-modifying — never gated, never counted in
+  `actions_executed`. `approve` fails closed on `False`/exception.
 
 **Boundary / non-goal (0.x).** This freshness gate is a *generic* XML-fingerprint
 + foreground check; it is **not** the final Pack `resolve/verify` ABI. It can

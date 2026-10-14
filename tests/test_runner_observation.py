@@ -177,7 +177,10 @@ def test_xml_change_before_execute_discards_action(tmp_path, monkeypatch):
     first = _records(tmp_path)[0]
     assert first["note"] == "reobserve_required"
     assert first["executed"] is False
-    assert first["execution_observation_id"] is not None
+    check = first["execution_check"]
+    assert check["check_id"]
+    assert check["xml_changed"] is True
+    assert check["changed"] is True
 
 
 # C ----------------------------------------------------------------------------
@@ -254,20 +257,27 @@ def test_journal_records_observation_ids_and_phases(tmp_path, monkeypatch):
 
     rec = _records(tmp_path)[0]
     assert rec["proposal_observation_id"]
-    assert rec["execution_observation_id"]
-    assert rec["proposal_observation_id"] != rec["execution_observation_id"]
+    assert rec["execution_check"]["check_id"]
     obs = rec["observation"]
     for key in (
         "capture_started_at",
         "capture_finished_at",
-        "xml_before_at",
-        "screenshot_at",
-        "xml_after_at",
-        "foreground_at",
+        "foreground_before_at",
+        "xml_before_started_at",
+        "xml_before_finished_at",
+        "screenshot_started_at",
+        "screenshot_finished_at",
+        "xml_after_started_at",
+        "xml_after_finished_at",
+        "foreground_after_at",
+        "foreground_before",
+        "foreground_after",
+        "xml_fingerprint_before",
+        "xml_fingerprint_after",
         "skew_ms",
     ):
         assert key in obs
-    assert "xml" not in obs or obs["xml"].endswith(".xml")  # reference, not raw tree
+    assert obs["xml"].endswith(".xml")  # reference, not raw tree
 
 
 # G ----------------------------------------------------------------------------
@@ -307,8 +317,9 @@ def test_approve_veto_fails_closed(tmp_path, monkeypatch):
     assert adb.tap_calls == 0
     rec = _records(tmp_path)[0]
     assert rec["approve_result"] is False
-    # approve must receive the fresh execution observation, not the proposal one
-    assert seen[0].observation_id == rec["execution_observation_id"]
+    # approve runs on the stable proposal observation, before the freshness check
+    assert seen[0].observation_id == rec["proposal_observation_id"]
+    assert rec["execution_check"] is None  # vetoed before any freshness re-read
 
 
 # I ----------------------------------------------------------------------------
@@ -327,3 +338,98 @@ def test_approve_exception_fails_closed(tmp_path, monkeypatch):
 
     assert res.result == "approve_rejected"
     assert adb.tap_calls == 0
+
+
+# J: drift during human confirmation ------------------------------------------
+def test_approve_changes_xml_then_zero_action(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    adb = ScriptedAdb()  # stable <p/> for the proposal sandwich
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+
+    def approve_then_page_moves(action, obs):
+        adb._dumps = ["<q/>"]  # UI changes during confirmation
+        return True
+
+    res = runner.run(
+        adb, client, FakePack(), tmp_path,
+        max_steps=5, settle_s=0, capture_settle_s=0, approve=approve_then_page_moves,
+    )
+
+    assert res.result == "terminate_success"
+    assert adb.tap_calls == 0  # approved action discarded, page moved
+    assert res.reobserves == 1
+    first = _records(tmp_path)[0]
+    assert first["approve_result"] is True
+    assert first["note"] == "reobserve_required"
+    assert first["execution_check"]["xml_changed"] is True
+
+
+def test_approve_changes_foreground_then_zero_action(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    adb = ScriptedAdb()  # com.test for the proposal sandwich
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+
+    def approve_then_foreground_moves(action, obs):
+        adb._fg = ["com.other"]  # foreground changes during confirmation
+        return True
+
+    res = runner.run(
+        adb, client, FakePack(), tmp_path,
+        max_steps=5, settle_s=0, capture_settle_s=0, approve=approve_then_foreground_moves,
+    )
+
+    assert res.result == "terminate_success"
+    assert adb.tap_calls == 0
+    assert res.reobserves == 1
+    first = _records(tmp_path)[0]
+    assert first["approve_result"] is True
+    assert first["execution_check"]["foreground_changed"] is True
+
+
+# K: FreshnessCheck must not fabricate a screenshot time -----------------------
+def test_freshness_check_has_no_screenshot_time(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    adb = ScriptedAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    runner.run(adb, client, FakePack(), tmp_path, max_steps=5, settle_s=0, capture_settle_s=0)
+
+    check = _records(tmp_path)[0]["execution_check"]
+    assert "started_at" in check and "finished_at" in check
+    assert not any("screenshot" in key for key in check)
+
+
+# L: proposal and final freshness check are linkable in the journal -----------
+def test_journal_links_proposal_and_freshness(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    adb = ScriptedAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    runner.run(adb, client, FakePack(), tmp_path, max_steps=5, settle_s=0, capture_settle_s=0)
+
+    rec = _records(tmp_path)[0]
+    check = rec["execution_check"]
+    # the final check records the proposal's foreground + fingerprint, so a reader
+    # can tie the executed action back to the exact observation it was proposed on
+    assert rec["observation"]["foreground"] == check["foreground_before"]
+    assert rec["observation"]["xml_fingerprint"] == check["fingerprint_before"]
+    assert rec["proposal_observation_id"] != check["check_id"]
+

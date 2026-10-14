@@ -25,7 +25,12 @@ from .action_codec import action_signature, mapped_action, parse_tool_call
 from .adb_executor import Adb, execute_action
 from .errors import ManoError, ManoNetworkError
 from .media import image_data_url
-from .observation import Observation, capture_observation, recheck_before_execute
+from .observation import (
+    DEFAULT_MAX_SKEW_MS,
+    Observation,
+    capture_observation,
+    check_freshness,
+)
 
 
 _HISTORY_KEYS = ("action", "coordinate", "coordinate2", "text", "status", "button")
@@ -200,7 +205,7 @@ def run(
     step_timeout_s: int = 900,
     settle_s: float = 1.0,
     capture_settle_s: float = 0.4,
-    max_skew_ms: int = 4000,
+    max_skew_ms: int = DEFAULT_MAX_SKEW_MS,
     max_unstable: int = 3,
     max_reobserve: int = 3,
     approve: Optional[Callable[[dict, Observation], bool]] = None,
@@ -209,10 +214,13 @@ def run(
 
     Each step takes a bounded, coherent Observation (screenshot + XML + foreground
     captured close together and checked for stability); the model and the Pack
-    guard share that single bundle. Before any device-modifying action the loop
-    re-observes and, if the foreground or XML changed, discards the stale action
-    and re-observes instead of executing it. ``wait`` is non-device-modifying: it
-    is never gated by ``approve`` and never counted in ``actions_executed``.
+    guard share that single bundle. For a device-modifying action the order is
+    ``stable proposal -> approve -> final freshness check -> execute``: the
+    consumer approves the proposed action against the stable proposal observation,
+    then a final ``FreshnessCheck`` catches any UI/foreground drift during that
+    confirmation and, if the page moved, discards the action with zero ADB input
+    and re-observes. ``wait`` is non-device-modifying: never gated by ``approve``
+    and never counted in ``actions_executed``.
     """
     ensure_adb_ready(adb)
     run_dir = Path(run_dir)
@@ -300,7 +308,7 @@ def run(
             "exec_error": None,
             "blocked_repeat": blocked_repeat,
             "oscillating": oscillating,
-            "execution_observation_id": None,
+            "execution_check": None,
             "approve_result": None,
             "note": "",
         }
@@ -342,14 +350,20 @@ def run(
             last_sig = sig
             continue
 
-        # Device-modifying: re-observe just before executing and veto a stale action.
-        exec_obs = recheck_before_execute(adb, obs, step)
-        record["execution_observation_id"] = exec_obs.observation_id
-        changed = (
-            exec_obs.foreground != obs.foreground
-            or exec_obs.xml_fingerprint != obs.xml_fingerprint
-        )
-        if changed:
+        # Device-modifying: approve on the stable proposal, then a final freshness
+        # check catches drift during that approval; on any change: zero ADB, re-observe.
+        if approve is not None:
+            ok = _safe_approve(approve, action, obs)
+            record["approve_result"] = ok
+            if not ok:
+                record["note"] = "approve_rejected"
+                log(record)
+                result = "approve_rejected"
+                break
+
+        check = check_freshness(adb, obs, step)
+        record["execution_check"] = check.to_log()
+        if check.changed:
             reobserve_streak += 1
             reobserves += 1
             record["note"] = "reobserve_required"
@@ -359,15 +373,6 @@ def run(
                 break
             continue
         reobserve_streak = 0
-
-        if approve is not None:
-            ok = _safe_approve(approve, action, exec_obs)
-            record["approve_result"] = ok
-            if not ok:
-                record["note"] = "approve_rejected"
-                log(record)
-                result = "approve_rejected"
-                break
 
         try:
             done = execute_action(adb, action, obs.width, obs.height)
