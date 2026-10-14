@@ -113,17 +113,23 @@ class FreshnessCheck:
 
     It is deliberately *not* an Observation: it never captures a frame and never
     fabricates a ``screenshot_*`` timestamp. It only answers "did the page move
-    since the proposal?" so the runner can veto a stale action.
+    since the proposal?" so the runner can veto a stale action. Foreground is read
+    on *both* sides of the slow ui_dump (``before -> ui_dump -> after``) so a
+    foreground switch during the dump is caught even when the XML looks unchanged.
     """
 
     check_id: str
     step: int
-    foreground: str
+    foreground_before: str  # fresh read before the ui_dump
+    foreground_after: str  # fresh read after the ui_dump
     xml_fingerprint: str
     started_at: int
+    foreground_before_at: int
+    xml_at: int
+    foreground_after_at: int
     finished_at: int
-    foreground_before: str  # the proposal's foreground
-    fingerprint_before: str  # the proposal's XML fingerprint
+    proposal_foreground: str  # the proposal's foreground
+    proposal_fingerprint: str  # the proposal's XML fingerprint
     foreground_changed: bool
     xml_changed: bool
     changed: bool
@@ -132,12 +138,16 @@ class FreshnessCheck:
     def to_log(self) -> dict:
         return {
             "check_id": self.check_id,
-            "foreground": self.foreground,
+            "foreground_before": self.foreground_before,
+            "foreground_after": self.foreground_after,
             "xml_fingerprint": self.xml_fingerprint,
             "started_at": self.started_at,
+            "foreground_before_at": self.foreground_before_at,
+            "xml_at": self.xml_at,
+            "foreground_after_at": self.foreground_after_at,
             "finished_at": self.finished_at,
-            "foreground_before": self.foreground_before,
-            "fingerprint_before": self.fingerprint_before,
+            "proposal_foreground": self.proposal_foreground,
+            "proposal_fingerprint": self.proposal_fingerprint,
             "foreground_changed": self.foreground_changed,
             "xml_changed": self.xml_changed,
             "changed": self.changed,
@@ -249,23 +259,37 @@ def capture_observation(
 
 def check_freshness(adb, proposal: Observation, step: int) -> FreshnessCheck:
     """Re-read foreground + XML just before executing and report whether the page
-    moved since ``proposal``. Takes no screenshot and fabricates no frame time."""
+    moved since ``proposal``. Takes no screenshot and fabricates no frame time.
+
+    Foreground is sampled on both sides of the slow ui_dump; a switch to another
+    app during the dump makes ``foreground_changed`` true even if the XML is
+    byte-identical, so we never tap into the wrong foreground.
+    """
     started = _now_ms()
-    foreground = adb.foreground_package()
+    foreground_before = adb.foreground_package()
+    foreground_before_at = _now_ms()
     xml = adb.ui_dump().decode("utf-8", errors="replace")
-    finished = _now_ms()
+    xml_at = _now_ms()
+    foreground_after = adb.foreground_package()
+    foreground_after_at = _now_ms()
     fp = xml_fingerprint(xml)
-    foreground_changed = foreground != proposal.foreground
+    foreground_changed = (
+        foreground_before != proposal.foreground or foreground_after != proposal.foreground
+    )
     xml_changed = fp != proposal.xml_fingerprint
     return FreshnessCheck(
         check_id=_new_id(),
         step=step,
-        foreground=foreground,
+        foreground_before=foreground_before,
+        foreground_after=foreground_after,
         xml_fingerprint=fp,
         started_at=started,
-        finished_at=finished,
-        foreground_before=proposal.foreground,
-        fingerprint_before=proposal.xml_fingerprint,
+        foreground_before_at=foreground_before_at,
+        xml_at=xml_at,
+        foreground_after_at=foreground_after_at,
+        finished_at=foreground_after_at,
+        proposal_foreground=proposal.foreground,
+        proposal_fingerprint=proposal.xml_fingerprint,
         foreground_changed=foreground_changed,
         xml_changed=xml_changed,
         changed=foreground_changed or xml_changed,

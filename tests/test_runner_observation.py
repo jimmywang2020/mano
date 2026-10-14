@@ -429,7 +429,48 @@ def test_journal_links_proposal_and_freshness(tmp_path, monkeypatch):
     check = rec["execution_check"]
     # the final check records the proposal's foreground + fingerprint, so a reader
     # can tie the executed action back to the exact observation it was proposed on
-    assert rec["observation"]["foreground"] == check["foreground_before"]
-    assert rec["observation"]["xml_fingerprint"] == check["fingerprint_before"]
+    assert rec["observation"]["foreground"] == check["proposal_foreground"]
+    assert rec["observation"]["xml_fingerprint"] == check["proposal_fingerprint"]
     assert rec["proposal_observation_id"] != check["check_id"]
+
+
+# M: foreground switches *during* the freshness ui_dump -----------------------
+class ForegroundFlipAdb(ScriptedAdb):
+    """ScriptedAdb that switches foreground while a specific ui_dump is running,
+    while the XML stays byte-identical (the race codex's injection reproduces)."""
+
+    def __init__(self, *, flip_on_dump: int) -> None:
+        super().__init__()
+        self._flip_on_dump = flip_on_dump
+        self._dump_seen = 0
+
+    def ui_dump(self) -> bytes:
+        self._dump_seen += 1
+        if self._dump_seen == self._flip_on_dump:
+            self._fg = ["com.other"]  # app switches mid-dump; XML unchanged
+        return super().ui_dump()
+
+
+def test_foreground_flip_during_freshness_dump_zero_action(tmp_path, monkeypatch):
+    _silence_sleep(monkeypatch)
+    # proposal sandwich does dumps #1-#2; the freshness re-read is dump #3.
+    adb = ForegroundFlipAdb(flip_on_dump=3)
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(adb, client, FakePack(), tmp_path, max_steps=5, settle_s=0, capture_settle_s=0)
+
+    assert adb.tap_calls == 0  # never tap into the switched foreground
+    assert res.reobserves == 1
+    first = _records(tmp_path)[0]
+    assert first["note"] == "reobserve_required"
+    check = first["execution_check"]
+    assert check["foreground_changed"] is True
+    assert check["xml_changed"] is False  # XML looked identical; foreground caught it
+    assert check["foreground_before"] == "com.test"
+    assert check["foreground_after"] == "com.other"
+
 
