@@ -449,7 +449,7 @@ def run(
             try:
                 execute_action(adb, resolved, obs.width, obs.height)
                 record["executed"] = True
-            except ManoError as exc:
+            except (ManoError, subprocess.CalledProcessError, OSError) as exc:
                 record["exec_error"] = str(exc)[:500]
                 log(record)
                 result = "exec_refused"
@@ -554,7 +554,7 @@ def run(
             done = execute_action(adb, final, obs.width, obs.height)
             record["executed"] = True
             actions_executed += 1
-        except ManoError as exc:
+        except (ManoError, subprocess.CalledProcessError, OSError) as exc:
             record["exec_error"] = str(exc)[:500]
             log(record)
             result = "exec_refused"

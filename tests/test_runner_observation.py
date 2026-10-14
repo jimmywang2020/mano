@@ -1104,6 +1104,18 @@ def test_validate_action_rejects_bad_input():
     assert action_codec.validate_action({"action": "terminate", "status": "maybe"}) == "bad_status"
 
 
+def test_validate_action_wait_time_must_be_finite():
+    # wait.time reaches time.sleep(); NaN raises ValueError there, Inf never wakes,
+    # bool is a degenerate int. All must fail closed as bad_time before execution.
+    assert action_codec.validate_action({"action": "wait", "time": float("nan")}) == "bad_time"
+    assert action_codec.validate_action({"action": "wait", "time": float("inf")}) == "bad_time"
+    assert action_codec.validate_action({"action": "wait", "time": float("-inf")}) == "bad_time"
+    assert action_codec.validate_action({"action": "wait", "time": True}) == "bad_time"
+    assert action_codec.validate_action({"action": "wait", "time": False}) == "bad_time"
+    assert action_codec.validate_action({"action": "wait", "time": 1}) is None
+    assert action_codec.validate_action({"action": "wait", "time": 0.5}) is None
+
+
 def test_terminate_meta_field_is_allowed_and_excluded_from_identity():
     action = {"action": "terminate", "status": "success", "status_inferred_from_text": True}
     assert action_codec.validate_action(action) is None

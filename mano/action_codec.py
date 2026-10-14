@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -125,9 +126,11 @@ def _coord_ok(value: Any) -> bool:
 
 
 def _is_number(value: Any) -> bool:
+    # wait.time reaches time.sleep(); bool and NaN/Inf must never get there.
+    if isinstance(value, bool):
+        return False
     try:
-        float(value)
-        return True
+        return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
 

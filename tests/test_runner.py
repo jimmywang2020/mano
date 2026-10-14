@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import struct
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -175,6 +176,62 @@ def test_wait_guard_blocks(tmp_path, monkeypatch):
     # wait is non-device-modifying: executed but never counted in actions_executed
     assert res.actions_executed == 0
     assert adb.tap_calls == 0
+
+
+def _run_with_exploding_tap(exc: Exception, tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+
+    class ExplodingAdb(FakeAdb):
+        def tap(self, x: int, y: int) -> None:
+            self.tap_calls += 1
+            raise exc
+
+    adb = ExplodingAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            # a second identical click would be reached only if the first polluted
+            # history / counted as executed; the run must break before this.
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+        ]
+    )
+    res = runner.run(adb, client, FakePack(), tmp_path, max_steps=10, settle_s=0)
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "steps.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    return res, adb, records
+
+
+def test_adb_called_process_error_refuses_without_crashing(tmp_path, monkeypatch):
+    res, adb, records = _run_with_exploding_tap(
+        subprocess.CalledProcessError(1, ["adb", "shell", "input", "tap"]),
+        tmp_path,
+        monkeypatch,
+    )
+    assert res.result == "exec_refused"
+    assert res.actions_executed == 0  # failed action is never counted
+    assert res.total_steps == 1  # broke on the first step; history not polluted
+    assert adb.tap_calls == 1
+    step_records = [r for r in records if r.get("step") == 1]
+    assert step_records, "journal must retain the failed step"
+    failed = step_records[-1]
+    assert failed["executed"] is False
+    assert failed["exec_error"]
+
+
+def test_adb_oserror_refuses_without_crashing(tmp_path, monkeypatch):
+    res, adb, records = _run_with_exploding_tap(
+        OSError("adb: device offline"), tmp_path, monkeypatch
+    )
+    assert res.result == "exec_refused"
+    assert res.actions_executed == 0
+    assert res.total_steps == 1
+    assert adb.tap_calls == 1
+    failed = [r for r in records if r.get("step") == 1][-1]
+    assert failed["executed"] is False
+    assert failed["exec_error"]
 
 
 def test_pack_guard_stops_before_vlm(tmp_path, monkeypatch):
