@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import unicodedata
 from typing import Any
 
 from .errors import ManoError
@@ -84,8 +85,16 @@ ALLOWED_ACTIONS = frozenset(
     {"click", "swipe", "type", "key", "system_button", "wait", "terminate"}
 )
 
-# type input is routed through `adb shell input text`; keep it ASCII/safe-shell.
+# Shell-safe ASCII subset for the default `adb shell input text` backend. The
+# charset is a *backend* concern now (AsciiAdbTextBackend owns this regex); the
+# generic layer below only enforces Unicode safety, not charset.
 TYPE_TEXT_RE = re.compile(r"[A-Za-z0-9 +._-]{1,80}")
+
+# Max text length (Unicode code points) the generic layer allows for any backend.
+_MAX_TEXT_CODEPOINTS = 80
+# Unicode general categories that must never reach a device/IME: control, format
+# and surrogate characters (plus NUL/CR/LF handled explicitly).
+_FORBIDDEN_TEXT_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 
 # key / system_button both map to a keyevent; value -> Android keycode.
 KEYEVENT_CODES = {"BACK": "4", "HOME": "3", "ENTER": "66", "CLEAR": "28"}
@@ -135,6 +144,21 @@ def _is_number(value: Any) -> bool:
         return False
 
 
+def _text_safety(value: Any) -> str | None:
+    # Generic, backend-agnostic text safety. Charset/transport is NOT checked here
+    # (that is the selected text backend's job): no normalize, truncate or rewrite.
+    if not isinstance(value, str):
+        return "bad_text"
+    if not value:
+        return "text_empty"
+    if len(value) > _MAX_TEXT_CODEPOINTS:
+        return "text_too_long"
+    for ch in value:
+        if ch in ("\x00", "\r", "\n") or unicodedata.category(ch) in _FORBIDDEN_TEXT_CATEGORIES:
+            return "text_control_character"
+    return None
+
+
 def validate_action(action: Any) -> str | None:
     """Reject untrusted Pack output before it reaches signatures / approve / verify
     / the device. Returns a stable error code (for the journal / BLOCK reason) or
@@ -169,9 +193,9 @@ def validate_action(action: Any) -> str | None:
             return "bad_" + coord_field
 
     if kind == "type":
-        text = action.get("text")
-        if not isinstance(text, str) or TYPE_TEXT_RE.fullmatch(text) is None:
-            return "bad_text"
+        code = _text_safety(action.get("text"))
+        if code is not None:
+            return code
     elif kind == "key":
         text = action.get("text")
         if not isinstance(text, str) or text.upper() not in KEYEVENT_CODES:

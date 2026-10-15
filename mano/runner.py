@@ -28,9 +28,8 @@ from .action_codec import (
     mapped_action,
     parse_tool_call,
     semantic_signature,
-    validate_action,
 )
-from .adb_executor import Adb, execute_action
+from .adb_executor import Adb, execute_action, validate_executable_action
 from .errors import ManoError, ManoNetworkError
 from .media import image_data_url
 from .observation import (
@@ -40,6 +39,7 @@ from .observation import (
     capture_revalidation,
 )
 from .pack import ALLOW, BLOCK, REOBSERVE, ResolveDecision, ResolvedAction, VerificationResult
+from .text_input import TextInputError
 
 
 _HISTORY_KEYS = ("action", "coordinate", "coordinate2", "text", "status", "button")
@@ -356,6 +356,8 @@ def run(
             "executed": False,
             "exec_error": None,
             "post_execute_error": None,
+            "text_error_code": None,
+            "action_may_have_executed": None,
             "blocked_repeat": False,
             "oscillating": False,
             "note": "",
@@ -394,9 +396,10 @@ def run(
             break
 
         # ALLOW: Pack output is untrusted input -> validate against the single
-        # whitelist before it can reach signatures / approve / verify / the device.
-        # Fail closed (zero ADB) with a stable error code; never crash the run.
-        invalid = validate_action(resolved)
+        # whitelist (generic + current text backend) before it can reach
+        # signatures / approve / verify / the device. Fail closed (zero device
+        # change) with a stable error code; never crash the run.
+        invalid = validate_executable_action(adb, resolved)
         if invalid is not None:
             record["note"] = "resolve_invalid_action"
             record["resolve_reason"] = invalid
@@ -521,7 +524,7 @@ def run(
                 continue
             candidate = verification.resolved_action
             # verify output is untrusted too: validate before anti-swap / execute.
-            invalid_verify = validate_action(candidate)
+            invalid_verify = validate_executable_action(adb, candidate)
             if invalid_verify is not None:
                 record["note"] = "verify_invalid_action"
                 record["verify_reason"] = invalid_verify
@@ -560,6 +563,15 @@ def run(
             done = execute_action(adb, final, obs.width, obs.height)
             record["executed"] = True
             actions_executed += 1
+        except TextInputError as exc:
+            # A text backend may leave an ambiguous state (restore failed after a
+            # possible injection): stop, never replay, and surface it distinctly.
+            record["text_error_code"] = exc.code
+            record["action_may_have_executed"] = exc.action_may_have_executed
+            record["exec_error"] = str(exc)[:500]
+            log(record)
+            result = "text_ambiguous_execution" if exc.action_may_have_executed else "exec_refused"
+            break
         except (ManoError, subprocess.CalledProcessError, OSError) as exc:
             record["exec_error"] = str(exc)[:500]
             log(record)

@@ -14,8 +14,9 @@ from pathlib import Path
 from shutil import which
 
 from .errors import ManoError
-from .action_codec import KEYEVENT_CODES, TYPE_TEXT_RE, int_coord, validate_action
+from .action_codec import KEYEVENT_CODES, int_coord, validate_action
 from .media import png_size
+from .text_input import AsciiAdbTextBackend, TextInputBackend
 
 
 # MuMu Player ships its own adb; used only as a fallback when there is no system
@@ -43,9 +44,12 @@ def find_adb() -> str:
 class Adb:
     """ADB executor with a deliberately small input/action surface."""
 
-    def __init__(self, serial: str):
+    def __init__(self, serial: str, *, text_backend: TextInputBackend | None = None):
         self.binary = find_adb()
         self.serial = serial
+        # The text transport is chosen when the executor is constructed; the model
+        # and Pack never select one. Default keeps the ASCII `input text` behaviour.
+        self.text_backend: TextInputBackend = text_backend or AsciiAdbTextBackend()
 
     def run(self, *args: str, capture: bool = True) -> subprocess.CompletedProcess[bytes]:
         cmd = [self.binary, "-s", self.serial, *args]
@@ -76,9 +80,7 @@ class Adb:
         )
 
     def type_text(self, text: str) -> None:
-        if TYPE_TEXT_RE.fullmatch(text) is None:
-            raise ManoError(f"refusing non-whitelisted text input: {text!r}")
-        self.shell("input", "text", text.replace(" ", "%s"))
+        self.text_backend.type_text(self, text)
 
     def keyevent(self, value: str) -> None:
         key = KEYEVENT_CODES.get(value.upper())
@@ -111,6 +113,24 @@ class Adb:
         return ""
 
 
+_DEFAULT_TEXT_BACKEND = AsciiAdbTextBackend()
+
+
+def validate_executable_action(adb: Adb, action: dict[str, object]) -> str | None:
+    """The single pre-execution validation entry used by the runner (resolve /
+    verify) AND execute_action: generic/structural + Unicode safety, then the
+    current text backend's charset/transport check. Returns a stable error code
+    or ``None``. Keeps runner-allows / executor-rejects from ever diverging.
+    """
+    code = validate_action(action)
+    if code is not None:
+        return code
+    if action.get("action") == "type":
+        backend = getattr(adb, "text_backend", None) or _DEFAULT_TEXT_BACKEND
+        return backend.validate(str(action.get("text", "")))
+    return None
+
+
 def execute_action(
     adb: Adb, action: dict[str, object], width: int, height: int
 ) -> bool:
@@ -120,7 +140,7 @@ def execute_action(
     the executor re-validates against the same single source of truth so no caller
     can drive the device with an action the whitelist would reject.
     """
-    invalid = validate_action(action)
+    invalid = validate_executable_action(adb, action)
     if invalid is not None:
         raise ManoError(f"refusing invalid action [{invalid}]: {action!r}")
     kind = str(action.get("action", ""))

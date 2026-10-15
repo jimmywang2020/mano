@@ -1087,6 +1087,10 @@ def test_validate_action_accepts_whitelisted_actions():
         {"action": "swipe", "coordinate": [10, 20], "coordinate2": [30, 40]}
     ) is None
     assert action_codec.validate_action({"action": "type", "text": "hello world"}) is None
+    # Generic layer is charset-agnostic now: Unicode and shell-unsafe ASCII both
+    # pass here; the selected text backend decides whether it can transmit them.
+    assert action_codec.validate_action({"action": "type", "text": "iPad Pro (2022) 11.0英寸"}) is None
+    assert action_codec.validate_action({"action": "type", "text": "rm -rf /;"}) is None
     assert action_codec.validate_action({"action": "key", "text": "BACK"}) is None
     assert action_codec.validate_action({"action": "system_button", "button": "HOME"}) is None
     assert action_codec.validate_action({"action": "wait", "time": 0.5}) is None
@@ -1099,7 +1103,11 @@ def test_validate_action_rejects_bad_input():
     assert action_codec.validate_action({"action": "click", "coordinate": [10, 20], "x": 1}) == "unknown_field"
     assert action_codec.validate_action({"action": "click", "coordinate": [2000, 1]}) == "bad_coordinate"
     assert action_codec.validate_action({"action": "click", "coordinate": [1]}) == "bad_coordinate"
-    assert action_codec.validate_action({"action": "type", "text": "rm -rf /;"}) == "bad_text"
+    assert action_codec.validate_action({"action": "type", "text": 123}) == "bad_text"
+    assert action_codec.validate_action({"action": "type", "text": ""}) == "text_empty"
+    assert action_codec.validate_action({"action": "type", "text": "x" * 81}) == "text_too_long"
+    assert action_codec.validate_action({"action": "type", "text": "a\nb"}) == "text_control_character"
+    assert action_codec.validate_action({"action": "type", "text": "a\x00b"}) == "text_control_character"
     assert action_codec.validate_action({"action": "key", "text": "ZOOM"}) == "bad_key"
     assert action_codec.validate_action({"action": "terminate", "status": "maybe"}) == "bad_status"
 

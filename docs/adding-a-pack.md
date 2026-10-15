@@ -213,6 +213,47 @@ Key points when integrating:
   journaling is a Non-goal below. Core passes only the execution facts and never
   interprets the metadata.
 
+### Text input is backend-dependent
+
+The action protocol is unchanged: a Pack still emits `{"action": "type",
+"text": "..."}` and never picks a transport (no `backend`/`ime` field). *How* the
+text reaches the device is a **text backend** chosen when the executor (`Adb`) is
+constructed:
+
+- `AsciiAdbTextBackend` (default) — `adb shell input text`, shell-safe ASCII only.
+- `AdbKeyboardTextBackend` (optional, explicit) — Unicode via the external *ADB
+  Keyboard* IME; never auto-installed, temporarily switches IME and restores it.
+
+Validation is two orthogonal layers, both reached through one combined entry
+`validate_executable_action(adb, action)` (used by the runner on `resolve` and
+`verify` output **and** by `execute_action`, so runner-allows can never diverge
+from executor-rejects):
+
+- `action_codec.validate_action` — generic/Unicode safety for every backend:
+  non-empty, ≤ 80 code points, no NUL/CR/LF, no control/format/surrogate
+  characters (`Cc`/`Cf`/`Cs`); never normalizes, truncates or rewrites.
+- `backend.validate(text)` — a **pure** charset/transport check (no device). The
+  ASCII backend rejects parentheses/Chinese as `text_unsupported_by_backend`; the
+  ADB-Keyboard backend accepts them.
+
+Capability is read-only and declared by the Consumer, not the Pack: Core exposes
+`backend.preflight(adb)` (read-only ADB) and the pure `backend.validate`; the
+Consumer reads its own canonical query, `validate` + `preflight`, and only starts
+once the capability is satisfied — "fail before the run", not mid-ADB. A Pack that
+needs Unicode text therefore relies on the Consumer having configured a Unicode
+backend; with the default ASCII backend such text fails closed (zero device
+change), it is **never** silently downgraded, truncated or garbled.
+
+Backend failures carry a structured code plus `retryable` and
+`action_may_have_executed`. The important one is `text_backend_restore_failed`
+(IME restore failed *after* a possible injection): the execution state is
+ambiguous, so the run stops as `text_ambiguous_execution` and the input is
+**never replayed**. No text failure is auto-retried by the Core.
+
+> Device status: the ADB-Keyboard backend is **code-level complete**; real-device
+> Unicode must be re-verified after a human installs the assistive IME (the
+> current MuMu image has none, so `FakeAdb` tests alone do not certify it).
+
 ### Stable semantic identity (Pack contract)
 
 `semantic_target` is the backbone of every anti-loop guard, the Consumer
