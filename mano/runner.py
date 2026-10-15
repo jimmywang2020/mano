@@ -17,6 +17,7 @@ import json
 import subprocess
 import time
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -354,6 +355,7 @@ def run(
             "final_resolved_action": None,
             "executed": False,
             "exec_error": None,
+            "post_execute_error": None,
             "blocked_repeat": False,
             "oscillating": False,
             "note": "",
@@ -490,6 +492,7 @@ def run(
             continue
 
         final = resolved
+        final_metadata = decision.metadata
         verify = getattr(pack, "verify", None)
         if callable(verify):
             record["verification_mode"] = "pack_verify"
@@ -534,6 +537,9 @@ def run(
                 result = "verify_semantic_swap_blocked"
                 break
             final = candidate
+            # Strict: once verify ran, its metadata is the execution-time truth
+            # (even {}); never fall back to stale resolve metadata.
+            final_metadata = verification.metadata
         else:
             # Legacy fallback (no Pack.verify): foreground already safe; a raw-XML
             # change means re-observe, otherwise execute the initial resolved action.
@@ -559,6 +565,26 @@ def run(
             log(record)
             result = "exec_refused"
             break
+
+        # Optional post-execute notification: the device change already happened,
+        # so a hook failure stops the run (never replays) and is NOT an ADB
+        # failure. Deep copies keep this untrusted extension point from mutating
+        # the audited final action / metadata.
+        hook = getattr(pack, "on_action_executed", None)
+        if callable(hook):
+            try:
+                hook(
+                    executed=ResolvedAction(
+                        semantic_target=decision.semantic_target,
+                        resolved_action=deepcopy(final),
+                        metadata=deepcopy(final_metadata),
+                    )
+                )
+            except Exception as exc:
+                record["post_execute_error"] = str(exc)[:500]
+                log(record)
+                result = "post_execute_hook_failed"
+                break
 
         log(record)
         history.append(_compact(final))

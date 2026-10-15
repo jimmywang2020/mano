@@ -17,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from mano import adb_executor, runner
-from mano.pack import ALLOW, ResolveDecision
+from mano.pack import ALLOW, BLOCK, REOBSERVE, ResolveDecision, ResolvedAction, VerificationResult
 
 
 def _png_header(width: int, height: int) -> bytes:
@@ -37,6 +37,8 @@ class FakeAdb:
         self.ui_dump_calls = 0
         self.tap_calls = 0
         self.swipe_calls = 0
+        self.type_calls = 0
+        self.keyevent_calls = 0
 
     def run(self, *args, capture: bool = True):
         return SimpleNamespace(stdout=b"device")
@@ -59,6 +61,12 @@ class FakeAdb:
 
     def swipe(self, x1, y1, x2, y2, duration_ms: int = 700) -> None:
         self.swipe_calls += 1
+
+    def type_text(self, text: str) -> None:
+        self.type_calls += 1
+
+    def keyevent(self, name: str) -> None:
+        self.keyevent_calls += 1
 
 
 class FakeClient:
@@ -108,6 +116,66 @@ class FakePack:
             verdict=ALLOW,
             semantic_target=target,
             resolved_action=dict(proposed_action),
+        )
+
+
+class HookPack(FakePack):
+    """FakePack plus an optional on_action_executed that records every call."""
+
+    def __init__(self, guard_result: str | None = None, *, raises: bool = False) -> None:
+        super().__init__(guard_result)
+        self.hook_calls: list[ResolvedAction] = []
+        self._raises = raises
+
+    def on_action_executed(self, *, executed: ResolvedAction) -> None:
+        self.hook_calls.append(executed)
+        if self._raises:
+            raise RuntimeError("pack state update failed")
+
+
+class VerifyHookPack(HookPack):
+    """resolve tags its own metadata; verify re-resolves the coordinate and
+    returns its own metadata. Used to prove the hook gets the post-verify action
+    and the verify-stage metadata (even when empty)."""
+
+    def __init__(self, *, verify_coordinate, verify_metadata, resolve_metadata) -> None:
+        super().__init__()
+        self._verify_coordinate = verify_coordinate
+        self._verify_metadata = verify_metadata
+        self._resolve_metadata = resolve_metadata
+
+    def resolve(self, *, proposed_action, observation, model_text) -> ResolveDecision:
+        d = super().resolve(
+            proposed_action=proposed_action, observation=observation, model_text=model_text
+        )
+        return ResolveDecision(
+            verdict=ALLOW,
+            semantic_target=d.semantic_target,
+            resolved_action=d.resolved_action,
+            metadata=self._resolve_metadata,
+        )
+
+    def verify(self, *, approved_intent, fresh_observation) -> VerificationResult:
+        return VerificationResult(
+            verdict=ALLOW,
+            resolved_action={"action": "click", "coordinate": self._verify_coordinate},
+            metadata=self._verify_metadata,
+        )
+
+
+class VerdictHookPack(HookPack):
+    """resolve returns a fixed verdict (to prove the hook never fires on
+    BLOCK / REOBSERVE)."""
+
+    def __init__(self, verdict: str) -> None:
+        super().__init__()
+        self._verdict = verdict
+
+    def resolve(self, *, proposed_action, observation, model_text) -> ResolveDecision:
+        return ResolveDecision(
+            verdict=self._verdict,
+            semantic_target="t",
+            resolved_action={"action": "click", "coordinate": [100, 100]},
         )
 
 
@@ -232,6 +300,270 @@ def test_adb_oserror_refuses_without_crashing(tmp_path, monkeypatch):
     failed = [r for r in records if r.get("step") == 1][-1]
     assert failed["executed"] is False
     assert failed["exec_error"]
+
+
+# --- on_action_executed post-execute hook ----------------------------------
+
+
+def test_pack_without_hook_runs_unchanged(tmp_path, monkeypatch):
+    # FakePack has no on_action_executed; its absence must not break the loop.
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    assert not hasattr(FakePack(), "on_action_executed")
+    adb = FakeAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(adb, client, FakePack(), tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "terminate_success"
+    assert res.actions_executed == 1
+
+
+def test_hook_called_once_per_successful_device_action(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    pack = HookPack()
+    adb = FakeAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "click", "coordinate": [200, 200]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "terminate_success"
+    assert res.actions_executed == 2
+    # two device clicks -> two calls; terminate is excluded
+    assert len(pack.hook_calls) == 2
+    assert all(isinstance(c, ResolvedAction) for c in pack.hook_calls)
+
+
+def test_hook_receives_post_verify_coordinate_and_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    pack = VerifyHookPack(
+        verify_coordinate=[222, 333],
+        verify_metadata={"clicked_texts": ["搜索"]},
+        resolve_metadata={"clicked_texts": ["stale"]},
+    )
+    adb = FakeAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "terminate_success"
+    assert len(pack.hook_calls) == 1
+    # the hook sees the action actually handed to ADB (verify's coordinate) ...
+    assert pack.hook_calls[0].resolved_action["coordinate"] == [222, 333]
+    # ... and the verify-stage metadata, not the stale resolve metadata
+    assert pack.hook_calls[0].metadata == {"clicked_texts": ["搜索"]}
+
+
+def test_hook_uses_verify_metadata_even_when_empty(tmp_path, monkeypatch):
+    # Empty verify metadata means "no fresh structured evidence"; it must NOT
+    # silently fall back to resolve metadata (which may be stale).
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    pack = VerifyHookPack(
+        verify_coordinate=[200, 300],
+        verify_metadata={},
+        resolve_metadata={"clicked_texts": ["stale"]},
+    )
+    adb = FakeAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+    assert len(pack.hook_calls) == 1
+    assert pack.hook_calls[0].metadata == {}
+
+
+def test_hook_not_called_on_adb_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+
+    class ExplodingAdb(FakeAdb):
+        def tap(self, x: int, y: int) -> None:
+            self.tap_calls += 1
+            raise OSError("adb offline")
+
+    pack = HookPack()
+    adb = ExplodingAdb()
+    client = FakeClient([_tool_call({"action": "click", "coordinate": [100, 100]})])
+    res = runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "exec_refused"
+    assert pack.hook_calls == []
+
+
+def test_hook_not_called_on_block_reobserve_or_approve_veto(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    click = _tool_call({"action": "click", "coordinate": [100, 100]})
+
+    block = VerdictHookPack(BLOCK)
+    runner.run(FakeAdb(), FakeClient([click]), block, tmp_path / "block", max_steps=10, settle_s=0)
+    assert block.hook_calls == []
+
+    reobserve = VerdictHookPack(REOBSERVE)
+    runner.run(
+        FakeAdb(), FakeClient([click, click, click, click]), reobserve,
+        tmp_path / "reobs", max_steps=10, settle_s=0, max_reobserve=2,
+    )
+    assert reobserve.hook_calls == []
+
+    vetoed = HookPack()
+    res = runner.run(
+        FakeAdb(), FakeClient([click]), vetoed, tmp_path / "veto",
+        max_steps=10, settle_s=0, approve=lambda _a, _o: False,
+    )
+    assert res.result == "approve_rejected"
+    assert vetoed.hook_calls == []
+
+
+def test_hook_exception_stops_without_replay(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    pack = HookPack(raises=True)
+    adb = FakeAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            # a second identical click would run only if the hook failure replayed
+            # or failed to stop the loop.
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+        ]
+    )
+    res = runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "post_execute_hook_failed"
+    assert res.actions_executed == 1  # the executed action is still counted
+    assert adb.tap_calls == 1  # executed exactly once, never replayed
+    assert len(pack.hook_calls) == 1
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "steps.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    step1 = [r for r in records if r.get("step") == 1][-1]
+    assert step1["executed"] is True  # the device action really happened
+    assert step1["post_execute_error"]  # recorded as a hook failure ...
+    assert step1["exec_error"] is None  # ... NOT confused with an ADB failure
+
+
+def test_hook_not_called_for_wait_or_terminate(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr(adb_executor.time, "sleep", lambda *_a, **_k: None)
+    pack = HookPack()
+    adb = FakeAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "wait", "time": 0.2}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "terminate_success"
+    assert pack.hook_calls == []
+
+
+def test_hook_cannot_mutate_audited_action_or_history(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+
+    class MutatingPack(HookPack):
+        def on_action_executed(self, *, executed: ResolvedAction) -> None:
+            super().on_action_executed(executed=executed)
+            executed.resolved_action["coordinate"] = [999, 999]
+            executed.resolved_action["action"] = "swipe"
+            executed.metadata["injected"] = True
+
+    pack = MutatingPack()
+    adb = FakeAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "steps.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    step1 = [r for r in records if r.get("step") == 1][-1]
+    # the deep copy handed to the pack absorbed the mutation; the audited action
+    # in the journal is untouched
+    assert step1["final_resolved_action"] == {"action": "click", "coordinate": [100, 100]}
+
+
+def test_hook_state_update_prevents_reresolving_search_as_type(tmp_path, monkeypatch):
+    # Regression for the migration defect: once the query is typed, the Pack's
+    # post-execute state must make the next "click search" resolve to a click,
+    # not re-resolve back into another type.
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+
+    class StatefulSearchPack(FakePack):
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_typed = False
+            self.hook_calls: list[ResolvedAction] = []
+
+        def resolve(self, *, proposed_action, observation, model_text) -> ResolveDecision:
+            act = proposed_action.get("action")
+            if act == "type":
+                return ResolveDecision(
+                    verdict=ALLOW,
+                    semantic_target="search.query",
+                    resolved_action={"action": "type", "text": "iPad"},
+                )
+            if act == "click":
+                if not self.query_typed:
+                    # the legacy bug: query state never updated -> re-type
+                    return ResolveDecision(
+                        verdict=ALLOW,
+                        semantic_target="search.query",
+                        resolved_action={"action": "type", "text": "iPad"},
+                    )
+                return ResolveDecision(
+                    verdict=ALLOW,
+                    semantic_target="search.submit",
+                    resolved_action={"action": "click", "coordinate": [900, 50]},
+                )
+            return super().resolve(
+                proposed_action=proposed_action, observation=observation, model_text=model_text
+            )
+
+        def on_action_executed(self, *, executed: ResolvedAction) -> None:
+            self.hook_calls.append(executed)
+            if executed.resolved_action.get("action") == "type":
+                self.query_typed = True
+
+    pack = StatefulSearchPack()
+    adb = FakeAdb()
+    client = FakeClient(
+        [
+            _tool_call({"action": "type", "text": "iPad"}),
+            _tool_call({"action": "click", "coordinate": [900, 50]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "terminate_success"
+    assert res.actions_executed == 2
+    assert pack.query_typed is True
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "steps.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    step2 = [r for r in records if r.get("step") == 2][-1]
+    # step 2 executed a click (search submit), NOT a second type
+    assert step2["final_resolved_action"] == {"action": "click", "coordinate": [900, 50]}
 
 
 def test_pack_guard_stops_before_vlm(tmp_path, monkeypatch):

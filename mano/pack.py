@@ -112,3 +112,15 @@ class Pack(Protocol):
     # is an OPTIONAL capability. A pack without it runs the legacy raw-XML
     # fallback (foreground/raw-XML change -> REOBSERVE; otherwise execute the
     # initial resolved action). Real packs must implement verify.
+
+    # on_action_executed(*, executed: ResolvedAction) -> None is an OPTIONAL
+    # post-execute notification. The runner calls it once per *successfully
+    # executed device action*, after ADB confirms the change and before the next
+    # observation; never on wait/terminate, BLOCK/REOBSERVE, approve veto,
+    # foreground change, verify rejection, anti-swap, or ADB failure. ``executed``
+    # carries the semantic target, the final action handed to ADB (post-verify
+    # coordinates), and the final-stage metadata (verify's when verify ran -- even
+    # {} -- else resolve's), passed as deep copies; the Core never reads it. A
+    # pack that raises here stops the run (``post_execute_hook_failed``); the
+    # action already happened and is never replayed. Exactly-once holds only
+    # within one process's normal control flow, not across a crash.

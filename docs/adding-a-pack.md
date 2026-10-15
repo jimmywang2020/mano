@@ -189,6 +189,25 @@ Key points when integrating:
   `resource-id`/`clickable`) is deferred to Batch 2.
 - **`wait`** is non-device-modifying: never approved, never revalidated, never
   counted in `actions_executed`. `approve` fails closed on `False`/exception.
+- **`on_action_executed` (optional post-execute hook).** A Pack may expose
+  `on_action_executed(*, executed: ResolvedAction) -> None` to advance its own
+  app state after a change lands (e.g. "search query typed" so the next step
+  resolves "click search" as a click, not a second type). The Core calls it once
+  per **successfully executed device action**, after ADB confirms the change and
+  before the next observation; it is **never** called on `wait`/`terminate`,
+  `BLOCK`/`REOBSERVE`, approve veto, foreground change, verify rejection,
+  anti-swap, or ADB failure. `executed` carries the `semantic_target`, the final
+  action handed to ADB (post-`verify` coordinates), and the final-stage metadata
+  — `verify`'s when `verify` ran (**even `{}`**, which means "no fresh structured
+  evidence"; the Core never falls back to the possibly-stale resolve metadata),
+  else resolve's. Both are **deep copies**, so the hook cannot mutate the audited
+  action/metadata. If the hook raises, the device change already happened, so the
+  run stops with `post_execute_hook_failed` (recorded as `post_execute_error`, not
+  `exec_error`) and the action is **never replayed**. Exactly-once holds only
+  within one process's normal control flow — it is **not** promised across a
+  crash (ADB may succeed then the process die before the hook); durable
+  journaling is a Non-goal below. Core passes only the execution facts and never
+  interprets the metadata.
 
 ### Non-goals (0.x)
 
