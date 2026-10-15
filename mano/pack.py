@@ -34,9 +34,18 @@ class ResolvedAction:
     ``semantic_target`` is an opaque, comparable identity (e.g. ``home.search_field``).
     The Core never interprets it; it only freezes it, together with the action's
     non-coordinate side-effect fields, and refuses any later change to them.
+    It MUST be a *stable* App-level identity: while the same logical control still
+    exists and is uniquely identifiable, the same target MUST produce the same
+    identity across observations, even when coordinates, bounds, dynamic
+    presentation text, badges/timers, or unrelated XML change -- such volatile
+    signals belong in ``metadata``, never in the identity. The example naming is
+    illustrative only; any stable, unique, coordinate-free string is valid (the
+    Core enforces no naming format). See docs/adding-a-pack.md
+    "Stable semantic identity".
     ``resolved_action`` is the concrete action for the *current* page; only its
-    coordinates may be re-resolved later by ``verify``. ``metadata`` is auditable
-    provenance (matched text, rule id, ...).
+    coordinates may be re-resolved later by ``verify``. ``metadata`` is
+    JSON-serializable auditable provenance (matched text, dynamic placeholder,
+    rule id, ...); it never participates in identity.
     """
 
     semantic_target: str
@@ -46,7 +55,14 @@ class ResolvedAction:
 
 @dataclass
 class ResolveDecision:
-    """Result of ``Pack.resolve``: a verdict plus the resolved semantic action."""
+    """Result of ``Pack.resolve``: a verdict plus the resolved semantic action.
+
+    On ``ALLOW`` ``semantic_target`` MUST be the stable, coordinate-free identity
+    described on ``ResolvedAction`` (same control -> same identity while it still
+    exists and is uniquely identifiable). When the target cannot be uniquely
+    identified, return ``REOBSERVE`` or ``BLOCK`` rather than an unstable or
+    guessed identity.
+    """
 
     verdict: str  # ALLOW | REOBSERVE | BLOCK
     semantic_target: str

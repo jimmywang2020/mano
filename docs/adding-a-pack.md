@@ -184,9 +184,13 @@ Key points when integrating:
   (Batch 2) removes it by producing a stable, coordinate-free target.
 - **Duolingo is still a legacy passthrough.** `packs/duolingo/pack.py` does not
   interpret any control and has no `verify`; it runs the `legacy_raw_xml_fallback`
-  path with coordinate-embedded targets as described above. Real resolve/verify
-  from the answer-option XML (text-node hit-test, since the option nodes carry no
-  `resource-id`/`clickable`) is deferred to Batch 2.
+  path with coordinate-embedded targets as described above. A legacy pack MAY
+  temporarily use a coordinate-bearing identity, but that does **not** meet the
+  "Stable semantic identity" contract below, is **not** a model for new packs, and
+  MUST switch to a coordinate-free stable identity when it wires in real
+  `resolve`/`verify`. Real resolve/verify from the answer-option XML (text-node
+  hit-test, since the option nodes carry no `resource-id`/`clickable`) is deferred
+  to Batch 2.
 - **`wait`** is non-device-modifying: never approved, never revalidated, never
   counted in `actions_executed`. `approve` fails closed on `False`/exception.
 - **`on_action_executed` (optional post-execute hook).** A Pack may expose
@@ -208,6 +212,110 @@ Key points when integrating:
   crash (ADB may succeed then the process die before the hook); durable
   journaling is a Non-goal below. Core passes only the execution facts and never
   interprets the metadata.
+
+### Stable semantic identity (Pack contract)
+
+`semantic_target` is the backbone of every anti-loop guard, the Consumer
+`approve`, `verify` re-location, and `on_action_executed` state attribution. It
+MUST represent the **stable App-level role and intent** of a logical control, not
+how that control happens to look right now.
+
+- **Stability rule.** *While the same logical target still exists and is uniquely
+  identifiable*, changes to coordinates, bounds, position, dynamic presentation
+  text, badges, timers, carousel content, or unrelated XML MUST NOT change the
+  `semantic_target`. (The precondition matters: if the control genuinely became a
+  *different* control, the Pack must not keep the old identity — it should
+  re-resolve or, when ambiguous, `REOBSERVE`/`BLOCK`.)
+- **May participate in identity:** a page/feature domain (`home`, `search`,
+  `filter`), a stable control role (`search_entry`, `confirm_button`), a value
+  that is itself a stable business choice (`capacity:256G`), an App-provided
+  stable object id, or a Pack-defined stable state. The naming below is
+  **illustrative only** — any stable, unique, coordinate-free string is valid and
+  the Core enforces **no** naming format (e.g. both `home.search_entry` and
+  `home_search_entry_visible` are fine; packs need not rename an existing one):
+
+  ```text
+  home.search_entry
+  filter.capacity:256G
+  filter.confirm
+  product.open:<stable_product_id>
+  ```
+
+- **MUST NOT be the source of identity** (unless the thing itself is the target's
+  stable business value): `coordinate`/`coordinate2`, pixel bounds, XML node order
+  or list position, observation/screenshot id, XML fingerprint, time/countdown,
+  count badges, carousel/recommendation/ad text, dynamic placeholder, the model's
+  natural-language description, or any transient session id / random value. These
+  go in `metadata`.
+
+  ```text
+  # wrong (volatile / collides / coordinate-bound)
+  click:431,53
+  labels:["iphone 15"]
+  node[3]
+  xml_sha256:...
+
+  # right (structural role, coordinate-free)
+  home.search_entry
+  ```
+
+  Note: this is not "forbid all visible text". A stable filter value like `256G`
+  may be part of the identity; dynamic placeholders, prices and countdowns must
+  not be.
+
+- **Uniqueness.** Stable also means collision-free: the same logical target maps
+  to one identity across observations, and *different* logical targets map to
+  *different* identities. When a control cannot be uniquely determined, return
+  `REOBSERVE`/`BLOCK` — never keep an identity by treating a nearby or
+  similar-looking control as the original target.
+- **`verify` must re-find the same target.** `approved_intent` is the frozen
+  stable identity. Same target still uniquely present → `ALLOW` (coordinates may
+  be updated); page not ready / target temporarily gone / ambiguous → `REOBSERVE`;
+  wrong app / dangerous page / the control clearly became a different one →
+  `BLOCK`. `verify` must not rename the target, substitute an adjacent or
+  similar-text control, or change the identity because coordinates drifted. The
+  matched text and coordinates are re-location *evidence* and go in verify
+  `metadata`.
+- **`metadata` is auditable, JSON-serializable, and never part of identity.**
+  Dynamic placeholder, coordinates and match evidence live here.
+- **Core boundary.** The Core does not parse or infer identity content: it only
+  requires a non-empty string on `ALLOW`, freezes the approved `semantic_target`,
+  derives the semantic signature from it, hands the *same* identity to `verify`,
+  and forbids `verify` from swapping the action type / side-effect fields. Whether
+  the string is genuinely stable and names the right App control is the **Pack's**
+  responsibility; there is deliberately **no** Core regex check on target content
+  (stable identity is expressed differently per app).
+
+**Pack conformance tests (every production pack).**
+
+1. Same control, coordinates change → identity unchanged.
+2. Dynamic placeholder / recommendation text changes → identity unchanged.
+3. An unrelated XML node is added → identity unchanged.
+4. Target disappears → `verify` returns `REOBSERVE`, zero device action.
+5. The same coordinate becomes a different control → must NOT `ALLOW`.
+6. Multiple candidate targets present at once → `REOBSERVE` or `BLOCK`.
+7. Two different controls never produce the same identity.
+8. The same input resolved repeatedly serializes to a deterministic identity.
+
+**Core contract / integration test (Core + a fake pack).**
+
+9. When the same semantic target drifts in coordinates, the Core's repeat guard
+   still recognizes it as the same action (covered in this repo by
+   `tests/test_runner_observation.py::test_semantic_dedup_blocks_despite_coordinate_drift`
+   and `tests/test_runner.py::test_oscillation_guard_blocks`).
+
+**Case study (转转 home search box).**
+
+```text
+WRONG:
+  the home search box placeholder changes from "iphone 15" to "ipad"
+  and the semantic_target changes with it (labels:["iphone 15"] -> labels:["ipad"]).
+
+RIGHT:
+  the Pack recognizes the role from App structure (the unique wide search input
+  at the top of home + its adjacent search button) and always emits a stable
+  identity; the placeholder and coordinates go only into metadata.
+```
 
 ### Non-goals (0.x)
 
