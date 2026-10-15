@@ -136,12 +136,25 @@ def test_adbkeyboard_preflight_query_failure_is_retryable():
     assert adb.broadcast_calls() == []
 
 
-def test_adbkeyboard_input_failure_does_not_flag_executed():
+def test_adbkeyboard_empty_default_ime_fails_closed_before_switching():
+    # No restorable default IME -> refuse before touching the IME, not retryable.
+    adb = RecordingAdb(imes_available=_IME, default_ime="null")
+    with pytest.raises(TextInputError) as exc:
+        AdbKeyboardTextBackend().type_text(adb, "中文")
+    assert exc.value.code == "text_backend_unavailable"
+    assert exc.value.retryable is False
+    assert adb.broadcast_calls() == []
+    assert ("ime", "set", _IME) not in adb.calls  # never switched away
+
+
+def test_adbkeyboard_broadcast_failure_flags_ambiguous():
+    # The broadcast may have reached the device even if ADB's return path fails:
+    # conservatively flag a possible injection so the queue never replays.
     adb = RecordingAdb(imes_available=_IME, raise_prefixes=[("am", "broadcast")])
     with pytest.raises(TextInputError) as exc:
         AdbKeyboardTextBackend().type_text(adb, "中文")
     assert exc.value.code == "text_input_failed"
-    assert exc.value.action_may_have_executed is False
+    assert exc.value.action_may_have_executed is True
 
 
 def test_adbkeyboard_restore_failure_flags_ambiguous_execution():
@@ -157,8 +170,24 @@ def test_adbkeyboard_restore_failure_flags_ambiguous_execution():
         AdbKeyboardTextBackend().type_text(adb, "中文")
     assert exc.value.code == "text_backend_restore_failed"
     assert exc.value.action_may_have_executed is True
+    assert exc.value.device_state_may_have_changed is True
     assert exc.value.retryable is False
     assert adb.broadcast_calls()  # injection did happen
+
+
+def test_adbkeyboard_restore_default_failure_still_disables_assistive():
+    # The two restore steps are independent: a failed default-IME restore must not
+    # skip re-disabling the assistive IME that was not originally enabled.
+    adb = RecordingAdb(
+        imes_available=_IME,
+        imes_enabled="",
+        default_ime="com.sogou/.ime",
+        raise_prefixes=[("ime", "set", "com.sogou/.ime")],
+    )
+    with pytest.raises(TextInputError) as exc:
+        AdbKeyboardTextBackend().type_text(adb, "中文")
+    assert exc.value.code == "text_backend_restore_failed"
+    assert ("ime", "disable", _IME) in adb.calls  # attempted despite the earlier failure
 
 
 # --- combined validation entry + executor defense in depth --------------------
@@ -198,3 +227,13 @@ def test_execute_action_rejects_unsupported_text_without_injecting():
     with pytest.raises(adb_executor.ManoError):
         adb_executor.execute_action(adb, {"action": "type", "text": "中文"}, 1000, 1000)
     assert adb.typed == []  # executor rejected before reaching the device
+
+
+def test_adb_type_text_enforces_generic_safety(monkeypatch):
+    # The public Adb.type_text must not bypass the generic/Unicode safety layer,
+    # even behind a permissive backend that only checks non-emptiness.
+    monkeypatch.setattr(adb_executor, "find_adb", lambda: "/usr/bin/adb")
+    adb = adb_executor.Adb("serial", text_backend=AdbKeyboardTextBackend())
+    with pytest.raises(TextInputError) as exc:
+        adb.type_text("a\nb")
+    assert exc.value.code == "text_control_character"

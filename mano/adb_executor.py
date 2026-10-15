@@ -16,7 +16,7 @@ from shutil import which
 from .errors import ManoError
 from .action_codec import KEYEVENT_CODES, int_coord, validate_action
 from .media import png_size
-from .text_input import AsciiAdbTextBackend, TextInputBackend
+from .text_input import AsciiAdbTextBackend, TextInputBackend, TextInputError
 
 
 # MuMu Player ships its own adb; used only as a fallback when there is no system
@@ -80,6 +80,11 @@ class Adb:
         )
 
     def type_text(self, text: str) -> None:
+        # Public entry too: validate via the same combined gate before delegating,
+        # so a direct call can't bypass the generic/Unicode safety layer.
+        code = validate_executable_action(self, {"action": "type", "text": text})
+        if code is not None:
+            raise TextInputError(code)
         self.text_backend.type_text(self, text)
 
     def keyevent(self, value: str) -> None:

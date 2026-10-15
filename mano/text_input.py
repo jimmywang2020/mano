@@ -48,12 +48,16 @@ class TextInputError(ManoError):
         *,
         retryable: bool = False,
         action_may_have_executed: bool = False,
+        device_state_may_have_changed: bool = False,
         detail: str = "",
     ) -> None:
         super().__init__(detail or code)
         self.code = code
         self.retryable = retryable
         self.action_may_have_executed = action_may_have_executed
+        # Distinct from action_may_have_executed: the text may NOT have been typed
+        # yet the default/enabled IME state could have been left changed.
+        self.device_state_may_have_changed = device_state_may_have_changed
 
 
 @runtime_checkable
@@ -152,31 +156,49 @@ class AdbKeyboardTextBackend:
             raise TextInputError(
                 "text_backend_preflight_failed", retryable=True, detail=str(exc)[:200]
             ) from exc
+        if not original or original == "null":
+            # No known IME to switch back to -> refuse before changing anything.
+            # Not transient (re-querying won't conjure a default), so not retryable.
+            raise TextInputError(
+                "text_backend_unavailable", detail="no restorable default IME"
+            )
 
         was_enabled = self.IME_ID in enabled
-        injected = False
+        injection_attempted = False
         try:
             if not was_enabled:
                 adb.shell("ime", "enable", self.IME_ID)
             adb.shell("ime", "set", self.IME_ID)
             payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            # From here the device may already hold the text even if ADB's return
+            # path then fails: treat any later error as a possible injection.
+            injection_attempted = True
             adb.shell("am", "broadcast", "-a", self.BROADCAST_ACTION, "--es", "msg", payload)
-            injected = True
         except TextInputError:
             raise
         except Exception as exc:
-            raise TextInputError("text_input_failed", detail=str(exc)[:200]) from exc
+            raise TextInputError(
+                "text_input_failed",
+                action_may_have_executed=injection_attempted,
+                detail=str(exc)[:200],
+            ) from exc
         finally:
-            # Restore the original IME. If the text was already injected but this
-            # fails, the execution state is ambiguous -> flag it, do not replay.
+            # Restore each piece independently so a failed default-IME restore does
+            # not skip re-disabling the assistive IME; aggregate the errors.
+            restore_errors: list[str] = []
             try:
-                if original and original != "null":
-                    adb.shell("ime", "set", original)
-                if not was_enabled:
-                    adb.shell("ime", "disable", self.IME_ID)
+                adb.shell("ime", "set", original)
             except Exception as exc:
+                restore_errors.append(f"restore default IME: {str(exc)[:120]}")
+            if not was_enabled:
+                try:
+                    adb.shell("ime", "disable", self.IME_ID)
+                except Exception as exc:
+                    restore_errors.append(f"disable assistive IME: {str(exc)[:120]}")
+            if restore_errors:
                 raise TextInputError(
                     "text_backend_restore_failed",
-                    action_may_have_executed=injected,
-                    detail=str(exc)[:200],
-                ) from exc
+                    action_may_have_executed=injection_attempted,
+                    device_state_may_have_changed=True,
+                    detail="; ".join(restore_errors),
+                )

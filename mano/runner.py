@@ -53,6 +53,19 @@ _VERDICTS = frozenset({ALLOW, REOBSERVE, BLOCK})
 # device-modifying. (terminate is handled after resolve, before this classification.)
 _NON_DEVICE_ACTIONS = frozenset({"wait"})
 
+# Validation codes that denote a text problem (generic layer + text backend). The
+# legacy `bad_text` (non-string payload) counts too; identity is not the `text_`
+# prefix. Used to mirror the code into the structured text-error log fields.
+_TEXT_ERROR_CODES = frozenset(
+    {
+        "bad_text",
+        "text_empty",
+        "text_too_long",
+        "text_control_character",
+        "text_unsupported_by_backend",
+    }
+)
+
 
 
 @dataclass
@@ -73,6 +86,23 @@ class RunResult:
 
 def _compact(action: dict) -> dict:
     return {key: action[key] for key in _HISTORY_KEYS if key in action}
+
+
+def _record_text_error(
+    record: dict,
+    code: str,
+    *,
+    retryable: bool,
+    may_have_executed: bool,
+    state_changed: bool = False,
+) -> None:
+    """Mirror a text failure into one uniform set of fields across resolve / verify
+    / execute, so an Adapter reads the same keys regardless of which stage failed.
+    """
+    record["text_error_code"] = code
+    record["text_retryable"] = retryable
+    record["action_may_have_executed"] = may_have_executed
+    record["device_state_may_have_changed"] = state_changed
 
 
 def _is_local_tcp_serial(serial: str) -> bool:
@@ -357,7 +387,9 @@ def run(
             "exec_error": None,
             "post_execute_error": None,
             "text_error_code": None,
+            "text_retryable": None,
             "action_may_have_executed": None,
+            "device_state_may_have_changed": None,
             "blocked_repeat": False,
             "oscillating": False,
             "note": "",
@@ -403,6 +435,8 @@ def run(
         if invalid is not None:
             record["note"] = "resolve_invalid_action"
             record["resolve_reason"] = invalid
+            if invalid in _TEXT_ERROR_CODES:
+                _record_text_error(record, invalid, retryable=False, may_have_executed=False)
             log(record)
             result = "resolve_invalid_action"
             break
@@ -528,6 +562,8 @@ def run(
             if invalid_verify is not None:
                 record["note"] = "verify_invalid_action"
                 record["verify_reason"] = invalid_verify
+                if invalid_verify in _TEXT_ERROR_CODES:
+                    _record_text_error(record, invalid_verify, retryable=False, may_have_executed=False)
                 log(record)
                 result = "verify_invalid_action"
                 break
@@ -566,8 +602,13 @@ def run(
         except TextInputError as exc:
             # A text backend may leave an ambiguous state (restore failed after a
             # possible injection): stop, never replay, and surface it distinctly.
-            record["text_error_code"] = exc.code
-            record["action_may_have_executed"] = exc.action_may_have_executed
+            _record_text_error(
+                record,
+                exc.code,
+                retryable=exc.retryable,
+                may_have_executed=exc.action_may_have_executed,
+                state_changed=exc.device_state_may_have_changed,
+            )
             record["exec_error"] = str(exc)[:500]
             log(record)
             result = "text_ambiguous_execution" if exc.action_may_have_executed else "exec_refused"

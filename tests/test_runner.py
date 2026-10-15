@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 from mano import adb_executor, runner
 from mano.pack import ALLOW, BLOCK, REOBSERVE, ResolveDecision, ResolvedAction, VerificationResult
+from mano.text_input import TextInputError
 
 
 def _png_header(width: int, height: int) -> bytes:
@@ -591,3 +592,111 @@ def test_structured_result_and_journal(tmp_path, monkeypatch):
     lines = (tmp_path / "steps.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["proposed_action"]["action"] == "terminate"
+
+
+# --- pluggable text backend: runner-level fail-closed + structured fields -----
+
+
+class VerifyTextPack(FakePack):
+    """resolve passes a type action through; verify returns a type whose text the
+    backend cannot transmit (to prove verify-stage text rejection is zero-input)."""
+
+    def __init__(self, verify_text: str) -> None:
+        super().__init__()
+        self._verify_text = verify_text
+
+    def verify(self, *, approved_intent, fresh_observation) -> VerificationResult:
+        return VerificationResult(
+            verdict=ALLOW, resolved_action={"action": "type", "text": self._verify_text}
+        )
+
+
+class TextRaisingAdb(FakeAdb):
+    """FakeAdb whose type_text raises a given TextInputError at execute time."""
+
+    def __init__(self, error: TextInputError) -> None:
+        super().__init__()
+        self._error = error
+
+    def type_text(self, text: str) -> None:
+        self.type_calls += 1
+        raise self._error
+
+
+def _records(tmp_path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in (tmp_path / "steps.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_resolve_unsupported_text_blocks_zero_input(tmp_path, monkeypatch):
+    # Default ASCII backend + a Chinese resolve -> reject before any device call.
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    client = FakeClient([_tool_call({"action": "type", "text": "中文"})])
+    res = runner.run(adb, client, FakePack(), tmp_path, settle_s=0)
+
+    assert res.result == "resolve_invalid_action"
+    assert adb.type_calls == 0 and adb.tap_calls == 0
+    rec = _records(tmp_path)[-1]
+    assert rec["resolve_reason"] == "text_unsupported_by_backend"
+    assert rec["text_error_code"] == "text_unsupported_by_backend"
+    assert rec["text_retryable"] is False
+    assert rec["action_may_have_executed"] is False
+
+
+def test_verify_unsupported_text_blocks_zero_input(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    client = FakeClient([_tool_call({"action": "type", "text": "iPad"})])
+    res = runner.run(adb, client, VerifyTextPack("中文"), tmp_path, settle_s=0)
+
+    assert res.result == "verify_invalid_action"
+    assert adb.type_calls == 0
+    rec = _records(tmp_path)[-1]
+    assert rec["verify_reason"] == "text_unsupported_by_backend"
+    assert rec["text_error_code"] == "text_unsupported_by_backend"
+    assert rec["text_retryable"] is False
+
+
+def test_text_broadcast_failure_is_ambiguous_execution(tmp_path, monkeypatch):
+    # A possible-injection failure at execute -> stop as text_ambiguous_execution,
+    # flag action_may_have_executed, never replay.
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = TextRaisingAdb(
+        TextInputError("text_input_failed", action_may_have_executed=True)
+    )
+    client = FakeClient(
+        [
+            _tool_call({"action": "type", "text": "iPad"}),
+            _tool_call({"action": "type", "text": "iPad"}),  # must NOT be reached
+        ]
+    )
+    res = runner.run(adb, client, FakePack(), tmp_path, settle_s=0)
+
+    assert res.result == "text_ambiguous_execution"
+    assert res.total_steps == 1  # broke on step 1, no replay
+    assert adb.type_calls == 1
+    rec = _records(tmp_path)[-1]
+    assert rec["executed"] is False
+    assert rec["text_error_code"] == "text_input_failed"
+    assert rec["action_may_have_executed"] is True
+
+
+def test_text_error_retryable_preserved_in_log(tmp_path, monkeypatch):
+    # A transient backend failure stays exec_refused but preserves retryable=True
+    # and the detailed code so an Adapter can decide to retry.
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = TextRaisingAdb(
+        TextInputError("text_backend_preflight_failed", retryable=True)
+    )
+    client = FakeClient([_tool_call({"action": "type", "text": "iPad"})])
+    res = runner.run(adb, client, FakePack(), tmp_path, settle_s=0)
+
+    assert res.result == "exec_refused"
+    rec = _records(tmp_path)[-1]
+    assert rec["text_error_code"] == "text_backend_preflight_failed"
+    assert rec["text_retryable"] is True
+    assert rec["action_may_have_executed"] is False
