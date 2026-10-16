@@ -17,6 +17,7 @@ device, and it must re-validate (defense in depth) before injecting.
 from __future__ import annotations
 
 import base64
+import re
 import time
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -107,7 +108,15 @@ class AsciiAdbTextBackend:
 
 
 class AdbKeyboardTextBackend:
-    """Optional Unicode backend that relies on the external *ADB Keyboard* IME.
+    """LEGACY / DEPRECATED Unicode backend over the external *ADB Keyboard* IME.
+
+    Do NOT adopt for new (esp. Chinese) Consumers: real-device MuMu testing proved
+    a cold-start false success -- ``_await_active`` only confirms the
+    ``default_input_method`` settings value, which flips (~71ms) *before* the
+    broadcast receiver is ready, so the first ``ADB_INPUT_B64`` broadcast can be
+    silently dropped while the call still returns success. Prefer
+    ``OpenAtxAdbKeyboardBackend`` (broadcast-receipt based). Kept only until the
+    OpenATX backend passes device acceptance and Consumers migrate off it.
 
     Named for the concrete dependency on purpose: it needs that specific assistive
     IME, broadcast action and parameter protocol, and is NOT a generic "any
@@ -219,6 +228,143 @@ class AdbKeyboardTextBackend:
         finally:
             # Restore each piece independently so a failed default-IME restore does
             # not skip re-disabling the assistive IME; aggregate the errors.
+            restore_errors: list[str] = []
+            try:
+                adb.shell("ime", "set", original)
+            except Exception as exc:
+                restore_errors.append(f"restore default IME: {str(exc)[:120]}")
+            if not was_enabled:
+                try:
+                    adb.shell("ime", "disable", self.IME_ID)
+                except Exception as exc:
+                    restore_errors.append(f"disable assistive IME: {str(exc)[:120]}")
+            if restore_errors:
+                raise TextInputError(
+                    "text_backend_restore_failed",
+                    action_may_have_executed=injection_attempted,
+                    device_state_may_have_changed=True,
+                    detail="; ".join(restore_errors),
+                )
+
+
+class OpenAtxAdbKeyboardBackend:
+    """Optional Unicode backend over the OpenATX uiautomator2 *AdbKeyboard* IME.
+
+    Readiness is proven by the broadcast *receipt*, not a settings value: the
+    OpenATX receiver returns ``result=-1`` once it has actually accepted the text
+    and ``result=0`` while a cold start is still cancelling, so only an explicit
+    ``result=0`` is retried (bounded, same-content ``SET_TEXT`` -> no appended
+    duplicates). An unparsable/unexpected receipt is treated as a possible
+    injection, never blindly re-sent. Depends on the specific OpenATX component,
+    action and parameter protocol; never auto-installed.
+    """
+
+    name = "openatx-adb-keyboard"
+    PACKAGE = "com.github.uiautomator"
+    IME_ID = "com.github.uiautomator/.AdbKeyboard"
+    SET_TEXT_ACTION = "ADB_KEYBOARD_SET_TEXT"
+    SUCCESS_RESULT = -1
+    CANCELLED_RESULT = 0
+    MAX_ATTEMPTS = 3
+    RETRY_SLEEP_S = 1.0
+    _RESULT_RE = re.compile(r"\bresult=(-?\d+)\b")
+
+    def validate(self, text: str) -> str | None:
+        # Generic/Unicode safety is enforced upstream in validate_action; the
+        # base64 payload carries any such string, so this stays pure + permissive.
+        if not isinstance(text, str) or not text:
+            return "text_unsupported_by_backend"
+        return None
+
+    def preflight(self, adb) -> TextInputCapability:
+        try:
+            installed = adb.shell("ime", "list", "-a")
+        except Exception as exc:
+            return TextInputCapability(
+                self.name, available=False, unicode=True,
+                reason=f"ime list failed: {str(exc)[:200]}",
+            )
+        if self.IME_ID in installed:
+            return TextInputCapability(self.name, available=True, unicode=True)
+        return TextInputCapability(
+            self.name, available=False, unicode=True,
+            reason=f"assistive IME not installed: {self.IME_ID}",
+        )
+
+    def _parse_result(self, output: str) -> int | None:
+        match = self._RESULT_RE.search(output or "")
+        return int(match.group(1)) if match else None
+
+    def type_text(self, adb, text: str) -> None:
+        code = self.validate(text)
+        if code is not None:
+            raise TextInputError(code)
+        cap = self.preflight(adb)
+        if not cap.available:
+            raise TextInputError("text_backend_unavailable", detail=cap.reason)
+
+        try:
+            original = adb.shell("settings", "get", "secure", "default_input_method").strip()
+            enabled = adb.shell("ime", "list", "-s")
+        except Exception as exc:
+            raise TextInputError(
+                "text_backend_preflight_failed", retryable=True, detail=str(exc)[:200]
+            ) from exc
+        if not original or original == "null":
+            # No known IME to switch back to -> refuse before changing anything.
+            raise TextInputError(
+                "text_backend_unavailable", detail="no restorable default IME"
+            )
+
+        was_enabled = self.IME_ID in enabled
+        injection_attempted = False
+        try:
+            if not was_enabled:
+                adb.shell("ime", "enable", self.IME_ID)
+            adb.shell("ime", "set", self.IME_ID)  # one switch covers all retries
+            payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            for attempt in range(self.MAX_ATTEMPTS):
+                # SET_TEXT replaces, so a retry re-sends identical content (never
+                # appends). From the broadcast on, the device may already hold it.
+                injection_attempted = True
+                output = adb.shell(
+                    "am", "broadcast", "-a", self.SET_TEXT_ACTION, "--es", "text", payload
+                )
+                result = self._parse_result(output)
+                if result == self.SUCCESS_RESULT:
+                    break
+                if result == self.CANCELLED_RESULT:
+                    # Explicit cancel: receiver not ready yet, retry same content.
+                    if attempt < self.MAX_ATTEMPTS - 1:
+                        time.sleep(self.RETRY_SLEEP_S)
+                    continue
+                # Unexpected number or no parsable receipt -> outcome unknown; do
+                # not blindly re-send; conservatively flag a possible injection.
+                raise TextInputError(
+                    "text_input_failed",
+                    action_may_have_executed=True,
+                    detail=f"unexpected broadcast receipt: {output[:160]!r}",
+                )
+            else:
+                # Every attempt was an explicit result=0: not received, so the text
+                # was not applied -> retryable, and not executed.
+                raise TextInputError(
+                    "text_backend_not_ready",
+                    retryable=True,
+                    action_may_have_executed=False,
+                    detail=f"OpenATX cancelled (result=0) after {self.MAX_ATTEMPTS} attempts",
+                )
+        except TextInputError:
+            raise
+        except Exception as exc:
+            raise TextInputError(
+                "text_input_failed",
+                action_may_have_executed=injection_attempted,
+                detail=str(exc)[:200],
+            ) from exc
+        finally:
+            # Restore each piece independently; aggregate errors (same policy as
+            # the legacy backend).
             restore_errors: list[str] = []
             try:
                 adb.shell("ime", "set", original)

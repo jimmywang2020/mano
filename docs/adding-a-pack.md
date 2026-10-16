@@ -221,8 +221,15 @@ text reaches the device is a **text backend** chosen when the executor (`Adb`) i
 constructed:
 
 - `AsciiAdbTextBackend` (default) — `adb shell input text`, shell-safe ASCII only.
-- `AdbKeyboardTextBackend` (optional, explicit) — Unicode via the external *ADB
-  Keyboard* IME; never auto-installed, temporarily switches IME and restores it.
+- `OpenAtxAdbKeyboardBackend` (optional, explicit) — Unicode via the OpenATX
+  uiautomator2 *AdbKeyboard* IME; success is proven by the broadcast receipt
+  (`result=-1`), an explicit `result=0` is retried (bounded), never
+  auto-installed, temporarily switches IME and restores it.
+- `AdbKeyboardTextBackend` (**legacy / deprecated**) — the original ADB-Keyboard
+  (`ADB_INPUT_B64`) backend; real-device testing proved a cold-start false
+  success (its `_await_active` confirms only the `default_input_method` value,
+  which flips before the receiver is ready). Do not adopt for new Consumers; kept
+  only until Consumers migrate to the OpenATX backend.
 
 Validation is two orthogonal layers, both reached through one combined entry
 `validate_executable_action(adb, action)` (used by the runner on `resolve` and
@@ -234,7 +241,7 @@ from executor-rejects):
   characters (`Cc`/`Cf`/`Cs`); never normalizes, truncates or rewrites.
 - `backend.validate(text)` — a **pure** charset/transport check (no device). The
   ASCII backend rejects parentheses/Chinese as `text_unsupported_by_backend`; the
-  ADB-Keyboard backend accepts them.
+  OpenATX and legacy ADB-Keyboard backends accept them.
 
 Capability is read-only and declared by the Consumer, not the Pack: Core exposes
 `backend.preflight(adb)` (read-only ADB) and the pure `backend.validate`; the
@@ -250,9 +257,13 @@ Backend failures carry a structured code plus `retryable` and
 ambiguous, so the run stops as `text_ambiguous_execution` and the input is
 **never replayed**. No text failure is auto-retried by the Core.
 
-> Device status: the ADB-Keyboard backend is **code-level complete**; real-device
-> Unicode must be re-verified after a human installs the assistive IME (the
-> current MuMu image has none, so `FakeAdb` tests alone do not certify it).
+> Device status: the **OpenATX** backend passed a real-device PoC (5/5 MuMu
+> cold starts, incl. `iPad Pro (2022) 11.0英寸`) but is **not yet certified in
+> this repo**; its `type_text` must still pass the full MuMu cold/hot-start
+> acceptance before any Consumer enables Chinese queries (`FakeAdb` tests alone
+> do not certify it). The **legacy** ADB-Keyboard backend is deprecated: it
+> reports available yet can silently drop a cold-start first injection. The APK
+> install/version is a Consumer/deployment concern, not the Pack's.
 
 ### Stable semantic identity (Pack contract)
 

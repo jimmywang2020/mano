@@ -13,6 +13,7 @@ from mano import adb_executor, text_input
 from mano.text_input import (
     AdbKeyboardTextBackend,
     AsciiAdbTextBackend,
+    OpenAtxAdbKeyboardBackend,
     TextInputError,
 )
 
@@ -23,6 +24,11 @@ class RecordingAdb:
     ``ime set X`` mutates the live default IME that ``settings get`` reports, so
     the backend's readiness poll can observe the switch. ``ready_after`` defers
     that switch by N readiness polls to emulate a cold-started IME.
+
+    ``broadcast_results`` scripts the ``am broadcast`` receipts, modelling the
+    receiver's readiness *independently* of the IME-switch state (the real
+    cold-start race): each ``int`` becomes ``result=<int>`` output, each ``str``
+    is returned verbatim (e.g. a receipt with no ``result=``).
     """
 
     def __init__(
@@ -32,6 +38,7 @@ class RecordingAdb:
         imes_enabled: str = "",
         default_ime: str = "com.sogou/.ime",
         ready_after: int = 0,
+        broadcast_results: list | None = None,
         raise_prefixes: list[tuple[str, ...]] | None = None,
     ) -> None:
         self.calls: list[tuple[str, ...]] = []
@@ -41,6 +48,7 @@ class RecordingAdb:
         self._ready_after = ready_after
         self._pending_target: str | None = None
         self._pending_polls = 0
+        self._broadcast_results = list(broadcast_results or [])
         self._raise_prefixes = raise_prefixes or []
         self.text_backend = AsciiAdbTextBackend()
 
@@ -49,6 +57,13 @@ class RecordingAdb:
         for prefix in self._raise_prefixes:
             if args[: len(prefix)] == prefix:
                 raise subprocess.CalledProcessError(1, list(args))
+        if args[:2] == ("am", "broadcast"):
+            if self._broadcast_results:
+                value = self._broadcast_results.pop(0)
+                if isinstance(value, str):
+                    return value
+                return f"Broadcasting: Intent {{ act={args[3]} }}\nBroadcast completed: result={value}"
+            return ""
         if args[:2] == ("ime", "set"):
             target = args[2]
             if target == _IME and self._ready_after > 0:
@@ -78,6 +93,7 @@ class RecordingAdb:
 
 
 _IME = AdbKeyboardTextBackend.IME_ID
+_OPENATX = OpenAtxAdbKeyboardBackend.IME_ID
 
 
 class _FakeClock:
@@ -275,6 +291,138 @@ def test_adbkeyboard_readiness_timeout_fails_before_injecting(monkeypatch):
     assert exc.value.action_may_have_executed is False
     assert adb.broadcast_calls() == []  # never injected
     assert ("ime", "set", "com.sogou/.ime") in adb.calls  # restored despite timeout
+
+
+# --- OpenAtxAdbKeyboardBackend: broadcast-receipt based Unicode ---------------
+
+_OPENATX_TEXT = "iPad Pro (2022) 11.0英寸"
+
+
+def _openatx_adb(**kwargs) -> RecordingAdb:
+    kwargs.setdefault("imes_available", _OPENATX)
+    kwargs.setdefault("imes_enabled", "")
+    kwargs.setdefault("default_ime", "com.sogou/.ime")
+    return RecordingAdb(**kwargs)
+
+
+def test_openatx_validate_and_preflight():
+    backend = OpenAtxAdbKeyboardBackend()
+    assert backend.validate(_OPENATX_TEXT) is None
+    assert backend.validate("") == "text_unsupported_by_backend"
+    assert backend.preflight(RecordingAdb(imes_available=_OPENATX)).available is True
+    assert backend.preflight(RecordingAdb(imes_available="")).available is False
+
+
+def test_openatx_first_broadcast_success():
+    adb = _openatx_adb(broadcast_results=[-1])
+    OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert len(adb.broadcast_calls()) == 1
+    assert ("ime", "set", "com.sogou/.ime") in adb.calls  # restored
+
+
+def test_openatx_retries_cancelled_then_succeeds(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(text_input, "time", clock)
+    adb = _openatx_adb(broadcast_results=[0, -1])
+    OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert len(adb.broadcast_calls()) == 2
+    assert clock.now == 1.0  # waited once between the two sends
+
+
+def test_openatx_all_cancelled_is_not_ready(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(text_input, "time", clock)
+    adb = _openatx_adb(broadcast_results=[0, 0, 0])
+    with pytest.raises(TextInputError) as exc:
+        OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert exc.value.code == "text_backend_not_ready"
+    assert exc.value.retryable is True
+    assert exc.value.action_may_have_executed is False
+    assert len(adb.broadcast_calls()) == 3  # bounded retries
+    assert ("ime", "set", "com.sogou/.ime") in adb.calls  # restored
+
+
+def test_openatx_unexpected_result_is_ambiguous_no_retry():
+    adb = _openatx_adb(broadcast_results=[1])
+    with pytest.raises(TextInputError) as exc:
+        OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert exc.value.code == "text_input_failed"
+    assert exc.value.action_may_have_executed is True
+    assert len(adb.broadcast_calls()) == 1  # unexpected number is not retried
+
+
+def test_openatx_unparsable_receipt_is_ambiguous_no_retry():
+    adb = _openatx_adb(broadcast_results=["Broadcasting: Intent {...}\n(no result line)"])
+    with pytest.raises(TextInputError) as exc:
+        OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert exc.value.code == "text_input_failed"
+    assert exc.value.action_may_have_executed is True
+    assert len(adb.broadcast_calls()) == 1
+
+
+def test_openatx_broadcast_raises_is_ambiguous_and_restores():
+    adb = _openatx_adb(raise_prefixes=[("am", "broadcast")])
+    with pytest.raises(TextInputError) as exc:
+        OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert exc.value.code == "text_input_failed"
+    assert exc.value.action_may_have_executed is True
+    assert ("ime", "set", "com.sogou/.ime") in adb.calls  # restored despite failure
+
+
+def test_openatx_unavailable_fails_closed():
+    adb = _openatx_adb(imes_available="")  # OpenATX IME not installed
+    with pytest.raises(TextInputError) as exc:
+        OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert exc.value.code == "text_backend_unavailable"
+    assert adb.broadcast_calls() == []
+
+
+def test_openatx_empty_default_ime_fails_closed():
+    adb = _openatx_adb(default_ime="null")
+    with pytest.raises(TextInputError) as exc:
+        OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert exc.value.code == "text_backend_unavailable"
+    assert adb.broadcast_calls() == []
+    assert ("ime", "set", _OPENATX) not in adb.calls  # never switched away
+
+
+def test_openatx_disables_assistive_when_not_originally_enabled():
+    adb = _openatx_adb(imes_enabled="", broadcast_results=[-1])
+    OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert ("ime", "disable", _OPENATX) in adb.calls
+
+
+def test_openatx_keeps_assistive_when_originally_enabled():
+    adb = _openatx_adb(imes_enabled=_OPENATX, broadcast_results=[-1])
+    OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert ("ime", "disable", _OPENATX) not in adb.calls  # leave it as it was
+
+
+def test_openatx_success_but_restore_fails_is_ambiguous():
+    adb = _openatx_adb(
+        broadcast_results=[-1],
+        raise_prefixes=[("ime", "set", "com.sogou/.ime")],  # only the restore fails
+    )
+    with pytest.raises(TextInputError) as exc:
+        OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    assert exc.value.code == "text_backend_restore_failed"
+    assert exc.value.action_may_have_executed is True
+    assert exc.value.device_state_may_have_changed is True
+    assert adb.broadcast_calls()  # injection did happen
+
+
+def test_openatx_retry_resends_same_set_text_never_appends(monkeypatch):
+    # Every attempt is SET_TEXT with the identical payload (replace semantics) so a
+    # retry cannot append a duplicate; final text-on-screen is a real-device check.
+    clock = _FakeClock()
+    monkeypatch.setattr(text_input, "time", clock)
+    adb = _openatx_adb(broadcast_results=[0, 0, -1])
+    OpenAtxAdbKeyboardBackend().type_text(adb, _OPENATX_TEXT)
+    bcasts = adb.broadcast_calls()
+    assert len(bcasts) == 3
+    payload = base64.b64encode(_OPENATX_TEXT.encode()).decode()
+    for call in bcasts:
+        assert call == ("am", "broadcast", "-a", "ADB_KEYBOARD_SET_TEXT", "--es", "text", payload)
 
 
 # --- combined validation entry + executor defense in depth --------------------
