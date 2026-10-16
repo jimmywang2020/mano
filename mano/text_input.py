@@ -17,6 +17,7 @@ device, and it must re-validate (defense in depth) before injecting.
 from __future__ import annotations
 
 import base64
+import time
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -118,6 +119,11 @@ class AdbKeyboardTextBackend:
     name = "adb-keyboard"
     IME_ID = "com.android.adbkeyboard/.AdbIME"
     BROADCAST_ACTION = "ADB_INPUT_B64"
+    # A cold-started IME can accept `ime set` yet drop an immediately following
+    # broadcast. Poll (bounded, short interval) until it is the active default
+    # before injecting; never a blind fixed sleep.
+    READY_TIMEOUT_S = 2.0
+    READY_POLL_S = 0.1
 
     def validate(self, text: str) -> str | None:
         # Generic/Unicode safety is enforced upstream in validate_action; the
@@ -140,6 +146,25 @@ class AdbKeyboardTextBackend:
             self.name, available=False, unicode=True,
             reason=f"assistive IME not installed: {self.IME_ID}",
         )
+
+    def _await_active(self, adb) -> bool:
+        """Bounded poll until the assistive IME is the active default. Returns
+        False on timeout. ``settings get`` is read-only; a probe error counts as
+        not-yet-ready, not a hard failure.
+        """
+        deadline = time.monotonic() + self.READY_TIMEOUT_S
+        while True:
+            try:
+                current = adb.shell(
+                    "settings", "get", "secure", "default_input_method"
+                ).strip()
+            except Exception:
+                current = ""
+            if current == self.IME_ID:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self.READY_POLL_S)
 
     def type_text(self, adb, text: str) -> None:
         code = self.validate(text)
@@ -169,6 +194,15 @@ class AdbKeyboardTextBackend:
             if not was_enabled:
                 adb.shell("ime", "enable", self.IME_ID)
             adb.shell("ime", "set", self.IME_ID)
+            if not self._await_active(adb):
+                # Switch accepted but IME not active yet: broadcasting now may be
+                # silently dropped. Fail before injecting (finally still restores);
+                # transient, so retryable once the IME has warmed up.
+                raise TextInputError(
+                    "text_backend_not_ready",
+                    retryable=True,
+                    detail=f"assistive IME not active within {self.READY_TIMEOUT_S}s",
+                )
             payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
             # From here the device may already hold the text even if ADB's return
             # path then fails: treat any later error as a possible injection.

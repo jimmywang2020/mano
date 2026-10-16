@@ -9,7 +9,7 @@ import subprocess
 
 import pytest
 
-from mano import adb_executor
+from mano import adb_executor, text_input
 from mano.text_input import (
     AdbKeyboardTextBackend,
     AsciiAdbTextBackend,
@@ -18,7 +18,12 @@ from mano.text_input import (
 
 
 class RecordingAdb:
-    """Records shell() calls; can be told to raise on given arg prefixes."""
+    """Records shell() calls; can be told to raise on given arg prefixes.
+
+    ``ime set X`` mutates the live default IME that ``settings get`` reports, so
+    the backend's readiness poll can observe the switch. ``ready_after`` defers
+    that switch by N readiness polls to emulate a cold-started IME.
+    """
 
     def __init__(
         self,
@@ -26,12 +31,16 @@ class RecordingAdb:
         imes_available: str = "",
         imes_enabled: str = "",
         default_ime: str = "com.sogou/.ime",
+        ready_after: int = 0,
         raise_prefixes: list[tuple[str, ...]] | None = None,
     ) -> None:
         self.calls: list[tuple[str, ...]] = []
         self._imes_available = imes_available
         self._imes_enabled = imes_enabled
-        self._default_ime = default_ime
+        self._current_ime = default_ime
+        self._ready_after = ready_after
+        self._pending_target: str | None = None
+        self._pending_polls = 0
         self._raise_prefixes = raise_prefixes or []
         self.text_backend = AsciiAdbTextBackend()
 
@@ -40,8 +49,24 @@ class RecordingAdb:
         for prefix in self._raise_prefixes:
             if args[: len(prefix)] == prefix:
                 raise subprocess.CalledProcessError(1, list(args))
+        if args[:2] == ("ime", "set"):
+            target = args[2]
+            if target == _IME and self._ready_after > 0:
+                self._pending_target = target
+                self._pending_polls = self._ready_after
+            else:
+                self._current_ime = target
+                self._pending_target = None
+                self._pending_polls = 0
+            return ""
         if args[:4] == ("settings", "get", "secure", "default_input_method"):
-            return self._default_ime
+            if self._pending_target is not None:
+                if self._pending_polls <= 0:
+                    self._current_ime = self._pending_target
+                    self._pending_target = None
+                else:
+                    self._pending_polls -= 1
+            return self._current_ime
         if args[:3] == ("ime", "list", "-s"):
             return self._imes_enabled
         if args[:3] == ("ime", "list", "-a"):
@@ -53,6 +78,20 @@ class RecordingAdb:
 
 
 _IME = AdbKeyboardTextBackend.IME_ID
+
+
+class _FakeClock:
+    """Monotonic clock whose only advance is via sleep(), so readiness polling is
+    deterministic and instant in tests."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
 
 
 # --- AsciiAdbTextBackend ------------------------------------------------------
@@ -188,6 +227,54 @@ def test_adbkeyboard_restore_default_failure_still_disables_assistive():
         AdbKeyboardTextBackend().type_text(adb, "中文")
     assert exc.value.code == "text_backend_restore_failed"
     assert ("ime", "disable", _IME) in adb.calls  # attempted despite the earlier failure
+
+
+# --- AdbKeyboardTextBackend: bounded IME-readiness wait (cold start) -----------
+
+def test_adbkeyboard_cold_start_waits_then_injects(monkeypatch):
+    # IME becomes active only after 2 readiness polls: the backend must wait
+    # rather than broadcast early, then inject successfully.
+    clock = _FakeClock()
+    monkeypatch.setattr(text_input, "time", clock)
+    adb = RecordingAdb(
+        imes_available=_IME, imes_enabled="", default_ime="com.sogou/.ime", ready_after=2
+    )
+    AdbKeyboardTextBackend().type_text(adb, "中文")
+    assert adb.broadcast_calls()  # eventually injected
+    assert clock.now > 0  # it actually waited for activation
+    assert ("ime", "set", "com.sogou/.ime") in adb.calls  # restored afterwards
+
+
+def test_adbkeyboard_hot_start_injects_without_waiting(monkeypatch):
+    # Already active on the first poll -> inject with zero wait.
+    clock = _FakeClock()
+    monkeypatch.setattr(text_input, "time", clock)
+    adb = RecordingAdb(
+        imes_available=_IME, imes_enabled="", default_ime="com.sogou/.ime", ready_after=0
+    )
+    AdbKeyboardTextBackend().type_text(adb, "中文")
+    assert adb.broadcast_calls()
+    assert clock.now == 0.0  # never slept
+
+
+def test_adbkeyboard_readiness_timeout_fails_before_injecting(monkeypatch):
+    # IME never activates: retryable not-ready error, never broadcast, and the
+    # original default IME is still restored.
+    clock = _FakeClock()
+    monkeypatch.setattr(text_input, "time", clock)
+    adb = RecordingAdb(
+        imes_available=_IME,
+        imes_enabled="",
+        default_ime="com.sogou/.ime",
+        ready_after=10**9,  # effectively never becomes active
+    )
+    with pytest.raises(TextInputError) as exc:
+        AdbKeyboardTextBackend().type_text(adb, "中文")
+    assert exc.value.code == "text_backend_not_ready"
+    assert exc.value.retryable is True
+    assert exc.value.action_may_have_executed is False
+    assert adb.broadcast_calls() == []  # never injected
+    assert ("ime", "set", "com.sogou/.ime") in adb.calls  # restored despite timeout
 
 
 # --- combined validation entry + executor defense in depth --------------------
