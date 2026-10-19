@@ -6,7 +6,10 @@
 > Source:《mano调用反馈_1016_1704》+《mano开发设计评审_1016_1724》, revised
 > per《mano开发设计评审_1019_1448》(full transition table, cross-Runner
 > uniqueness, recovery-before-new-action entry, dispatch_certainty rename,
-> reconciliation_context / schema_version, RECONCILIATION_UNAVAILABLE).
+> reconciliation_context / schema_version, RECONCILIATION_UNAVAILABLE) and
+>《mano开发计划评审_1019_1505》(atomic no-open-action prepare, reconciliation
+> never rewrites dispatch_certainty, hook NOT_APPLICABLE + ABI migration,
+> split pre/recovery observation refs).
 
 ## 1. Problem statement
 
@@ -55,34 +58,44 @@ NOT_EXECUTED    proven no device dispatch occurred
 OUTCOME_UNKNOWN ADB timeout / disconnect / ambiguous; dispatch MAY have happened
 ```
 
-`dispatch_certainty ∈ { NONE, POSSIBLE, CONFIRMED }` is **mandatory** on every
-terminal transition. It describes only whether the ADB command was *dispatched*
-— **not** whether the target app's semantic effect occurred (a `tap` dispatch can
-succeed without the filter actually toggling). The *semantic* question is
-answered separately by the Pack's `ALREADY_APPLIED | NOT_APPLIED | UNKNOWN` (§6).
+`dispatch_certainty ∈ { NONE, POSSIBLE, CONFIRMED }` is a **write-once** fact set
+by the dispatch-determining transition and **never rewritten** afterwards. It
+describes only whether the ADB command was *dispatched* — **not** whether the
+target app's semantic effect occurred (a `tap` dispatch can succeed without the
+filter actually toggling). The *semantic* question is answered separately by the
+Pack's `reconciliation_verdict` (§6), stored on its own field; it **must not**
+rewrite `dispatch_certainty`.
 
 | state | dispatch_certainty |
 |---|---|
 | `PREPARED` | `NONE` |
-| `DISPATCHING` | `POSSIBLE` |
+| `DISPATCHING` | `POSSIBLE` (write-once; the blurry window stays POSSIBLE forever) |
 | `EXECUTED` | `CONFIRMED` |
-| `FINALIZED` | `CONFIRMED` |
-| `NOT_EXECUTED` | `NONE` |
-| `OUTCOME_UNKNOWN` | `POSSIBLE` |
+| `NOT_EXECUTED` | `NONE` (only when Core can PROVE no dispatch) |
+| `OUTCOME_UNKNOWN` | `POSSIBLE` (inherited; reconciliation never lowers/raises it) |
+| `FINALIZED` | inherits whatever was set (`CONFIRMED` via EXECUTED, `POSSIBLE` via OUTCOME_UNKNOWN close) |
 
 ### Legal transitions (machine-checkable)
 
 ```
 PREPARED        -> DISPATCHING | NOT_EXECUTED
 DISPATCHING     -> EXECUTED | NOT_EXECUTED | OUTCOME_UNKNOWN
-OUTCOME_UNKNOWN -> EXECUTED | NOT_EXECUTED | OUTCOME_UNKNOWN   (re-reconcile allowed)
 EXECUTED        -> FINALIZED
+OUTCOME_UNKNOWN -> FINALIZED | OUTCOME_UNKNOWN   (close ONLY via reconciliation_verdict)
 ```
 
 Terminal states: `FINALIZED`, `NOT_EXECUTED`. `transition()` rejects any pair not
-in this table (invalid chain -> `JOURNAL_CORRUPT`). `OUTCOME_UNKNOWN` may be
-re-entered because a first reconciliation can itself be inconclusive; each
-re-entry is a fresh CAS transition (new revision), never an auto-replay.
+in this table (invalid chain -> `JOURNAL_CORRUPT`).
+
+**Reconciliation never rewrites dispatch facts.** From `OUTCOME_UNKNOWN`, a Pack
+`reconciliation_verdict` of `ALREADY_APPLIED` or `NOT_APPLIED` may close the
+record to `FINALIZED` **with `dispatch_certainty` unchanged (still POSSIBLE)** —
+it records *whether the effect is present now*, never *whether this ADB
+dispatched*. `UNKNOWN` keeps the record `OUTCOME_UNKNOWN` (re-enterable, fresh CAS
+each time) and hands it to the Consumer. `NOT_EXECUTED` is reachable **only** from
+a pre-dispatch state where Core can prove no dispatch occurred; a reconciliation
+verdict can never produce `NOT_EXECUTED`, because `NOT_APPLIED` (effect absent
+now) does not prove the click never dispatched.
 
 `load_open_actions(run_id)` returns every **non-terminal** record, i.e. any in:
 
@@ -99,7 +112,7 @@ PREPARED | DISPATCHING | EXECUTED | OUTCOME_UNKNOWN
 | `EXECUTED` | **never replay ADB**; Pack post-processing may need recovery (§6) |
 | `FINALIZED` | action complete; nothing to do |
 | `NOT_EXECUTED` | safe to enter re-observation |
-| `OUTCOME_UNKNOWN` | needs Pack semantic reconciliation or hand to Consumer |
+| `OUTCOME_UNKNOWN` | Pack `reconciliation_verdict`: `ALREADY_APPLIED`/`NOT_APPLIED` -> close to `FINALIZED` (dispatch_certainty stays POSSIBLE); `UNKNOWN` -> stays open, hand to Consumer |
 
 ## 4. Transition map onto the current runner flow
 
@@ -183,9 +196,13 @@ optional** Pack capability:
 ```python
 def reconcile_action(
     self, *, journaled_action, fresh_observation, recovery: bool = True
-) -> ReconciliationResult   # ALREADY_APPLIED | NOT_APPLIED | UNKNOWN
+) -> ReconciliationResult   # reconciliation_verdict: ALREADY_APPLIED | NOT_APPLIED | UNKNOWN
 ```
 
+- Returns a `reconciliation_verdict`, a **separate** semantic fact (§3): it may
+  close an `OUTCOME_UNKNOWN` record to `FINALIZED` but **never** rewrites
+  `dispatch_certainty`. `ALREADY_APPLIED` = effect present now; `NOT_APPLIED` =
+  effect absent now; neither proves whether the ADB click dispatched.
 - Called only during recovery, against a **fresh** post-restart observation, with
   the stable `action_id` (inside `journaled_action`) and `recovery=True` so the
   Pack can de-duplicate.
@@ -208,15 +225,22 @@ def reconcile_action(
 
 Covers: `ADB success -> EXECUTED durable -> SIGKILL before the hook runs`.
 
-- A Pack MUST declare `hook_recovery = IDEMPOTENT | NOT_REPLAYABLE` (Core reads
-  this; it is **not** merely documented).
+- A Pack MUST declare `hook_recovery = IDEMPOTENT | NOT_REPLAYABLE | NOT_APPLICABLE`
+  (Core reads this; it is **not** merely documented).
+- `NOT_APPLICABLE`: the Pack exposes no `on_action_executed` hook; on reaching
+  `EXECUTED` Core closes **directly to `FINALIZED`** with no hook replay. (The
+  current Pack Protocol makes the hook optional, so this is the default when the
+  attribute is absent.)
 - `IDEMPOTENT`: on recovery with `EXECUTED` but not `FINALIZED`, Core **replays
   the hook only, never the ADB action** (passing the stable `action_id` and
   `recovery=True`), then transitions to `FINALIZED`.
-- `NOT_REPLAYABLE` (or undeclared): recovery result is `UNKNOWN`, the hook is
-  **not** replayed, the ADB action is **never** replayed, and the Consumer
-  decides.
+- `NOT_REPLAYABLE`: recovery result is `UNKNOWN`, the hook is **not** replayed,
+  the ADB action is **never** replayed, and the Consumer decides.
 - Core records `hook_applied` on `FINALIZED`.
+- **Round-2 hook ABI migration (not this round):** the hook today is
+  `on_action_executed(*, executed: ResolvedAction)`. Passing `action_id` +
+  `recovery: bool` requires updating `mano/pack.py` (Protocol), every existing
+  Pack, and their tests — not only the Runner. This is a Round-2 code task.
 
 ## 7. Journal record — refs/hashes, not raw evidence
 
@@ -233,10 +257,11 @@ reconciliation_schema_version   mismatch -> PACK_INCOMPATIBLE
 semantic_target
 action_type
 execution_payload hash   reuse action_codec.execution_payload (§9); hash, not plaintext
-reconciliation_context   Pack-provided, constrained, non-sensitive (§6)
-fresh_observation refs   evidence IDs/refs + capture timestamps (NOT the bytes)
+reconciliation_context   Pack-provided at prepare(); JSON object; size-capped; non-sensitive only (§6)
+pre_execution_observation_refs   evidence IDs/refs + timestamps captured before PREPARED
+recovery_observation_refs        fresh refs captured during recovery (separate; never overwrites the above)
 foreground
-state, dispatch_certainty, hook_applied, hook_recovery
+state, dispatch_certainty, reconciliation_verdict, hook_applied, hook_recovery
 timestamps per transition
 ```
 
@@ -245,6 +270,10 @@ timestamps per transition
   is in-memory and keeps only an XML fingerprint; if recovery needs any
   execution-time context, the necessary refs/context MUST be captured into the
   record **before** `PREPARED` is durable.
+- `reconciliation_context` is supplied by the Pack at `prepare()`, MUST be a
+  JSON-serialisable object under a fixed size cap, and MUST hold only
+  non-sensitive semantic info; sensitive data is a hash or a Consumer-provided
+  encrypted evidence ref only.
 - For `type` actions: store `text hash` + `length` + `semantic_target` +
   encrypted evidence ref — **never** the plaintext. An ambiguous action is never
   auto-replayed, so the journal never needs directly-replayable plaintext.
@@ -274,13 +303,19 @@ class ActionJournal(Protocol):
 
 Requirements:
 
-- `prepare()` MUST be durable before it returns; it **assigns `action_sequence`
-  inside the DB transaction** (not from the Runner loop `step`) and rejects a
-  second `prepare()` for an existing `action_id`.
-- A DB-level `UNIQUE(run_id, action_sequence)` constraint is the real cross-Runner
-  guard: single-record CAS alone does **not** stop two Runners that mint
-  *different* `action_id`s for the same logical step. The Runner MUST resolve all
-  open actions (§5 recovery entry) before `prepare()`-ing the next one.
+- `prepare()` MUST be durable before it returns and MUST run as a single
+  `BEGIN IMMEDIATE` transaction that **atomically**: (1) verifies the run has **no
+  open action**, (2) assigns `action_sequence` (journal-side, not the Runner loop
+  `step`), (3) inserts the `PREPARED` row — and rejects a second `prepare()` for
+  an existing `action_id`.
+- The real cross-Runner guard is **"at most one open action per run"** enforced
+  in the DB (e.g. a partial unique index over non-terminal states for a given
+  `run_id`), **not** `UNIQUE(run_id, action_sequence)` alone: two Runners that
+  each find no open action could otherwise assign sequence 1 and 2 and both
+  proceed. With the atomic check above, two concurrent `prepare()`s on the same
+  run — even with different `action_id`s — let exactly one win; the other is
+  rejected. The Runner MUST resolve all open actions (§5 recovery entry) before
+  `prepare()`-ing the next one.
 - `transition()` MUST atomically check `expected_state` **and**
   `expected_revision` before applying; mismatch raises (no silent overwrite).
 - SQLite reference impl: real transactions + `PRAGMA journal_mode=WAL`,
@@ -322,8 +357,9 @@ Unit-level exception injection is insufficient. The matrix MUST include:
 8. journal state corruption (`JOURNAL_CORRUPT`).
 9. Pack reconciliation unavailable vs schema-incompatible
    (`RECONCILIATION_UNAVAILABLE` vs `PACK_INCOMPATIBLE`).
-10. two Runners race the same `(run_id, action_sequence)` (DB `UNIQUE` +
-    per-record CAS reject the loser).
+10. two Runners `prepare()` the same run **concurrently with different
+    `action_id`s** -> exactly one wins (atomic no-open-action check), the other
+    is rejected; the single device action is never double-dispatched.
 
 At least one case MUST use a **real subprocess + SIGKILL**, not a mock
 exception. The single machine-checkable acceptance assertion:
@@ -359,3 +395,22 @@ no ambiguous window ever auto-replays a device action
    is never replayed.
 4. **SQLite path:** Consumer-injected. Core ships `SQLiteActionJournal(path)` but
    the Runner never silently creates a default journal; `journal=None` = disabled.
+
+### Round 1c (source《mano开发计划评审_1019_1505》)
+
+5. **Cross-Runner safety:** `prepare()` is an atomic `BEGIN IMMEDIATE`
+   no-open-action check + sequence assign + insert; the DB enforces **at most one
+   open action per run** (partial unique index over non-terminal states), which
+   `UNIQUE(run_id, action_sequence)` alone does not. Failure case 10 is two
+   different `action_id`s racing the same run.
+6. **Reconciliation never rewrites dispatch facts:** `dispatch_certainty` is
+   write-once; the ambiguous window stays `POSSIBLE` forever. A Pack
+   `reconciliation_verdict` is a separate field that may close `OUTCOME_UNKNOWN`
+   to `FINALIZED` (ALREADY_APPLIED/NOT_APPLIED) or keep it open (UNKNOWN), but
+   never produces `NOT_EXECUTED` and never changes `dispatch_certainty`.
+7. **Hook ABI + no-hook:** add `hook_recovery = NOT_APPLICABLE` (no hook ->
+   EXECUTED closes straight to FINALIZED). Extending the hook to receive
+   `action_id` + `recovery` is a Round-2 migration of `mano/pack.py` + every Pack
+   + tests. Record splits observation refs into `pre_execution_observation_refs`
+   and `recovery_observation_refs`; `reconciliation_context` is a size-capped,
+   non-sensitive JSON object supplied at `prepare()`.
