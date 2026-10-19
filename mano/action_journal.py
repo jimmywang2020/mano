@@ -371,6 +371,9 @@ def _load_context(raw: str | None, *, action_id: str) -> dict[str, Any] | None:
             f"reconciliation_context not a dict for {action_id!r}"
         )
     return value
+
+
+def _as_busy(exc: sqlite3.OperationalError) -> Exception:
     msg = str(exc).lower()
     if "locked" in msg or "busy" in msg:
         return JournalBusyError(str(exc))
@@ -408,8 +411,11 @@ class SQLiteActionJournal:
             ).fetchall()
         }
         if version == 0 and not tables:
-            self._create_schema()
-            self._conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+            # create tables, index and version stamp in ONE transaction: a crash
+            # mid-init can never leave "tables exist but user_version=0".
+            with self._txn():
+                self._create_schema()
+                self._conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
             return
         if version != _SCHEMA_VERSION:
             raise SchemaVersionError(
@@ -421,14 +427,64 @@ class SQLiteActionJournal:
             raise JournalCorruptError(
                 f"schema v{version} missing tables: {sorted(missing)}"
             )
-        indexes = {
-            r[0]
-            for r in self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index'"
-            ).fetchall()
-        }
-        if "idx_one_open_per_run" not in indexes:
+        self._verify_v1_structure()
+
+    _REQUIRED_COLUMNS = {
+        "actions": frozenset({
+            "action_id", "run_id", "action_sequence", "revision", "state",
+            "dispatch_certainty", "reconciliation_verdict", "hook_applied",
+            "hook_recovery", "pack_id", "pack_digest",
+            "reconciliation_schema_version", "semantic_target", "action_type",
+            "execution_payload_hash", "reconciliation_context",
+            "pre_execution_observation_refs", "recovery_observation_refs",
+            "foreground", "created_at", "updated_at",
+        }),
+        "action_transitions": frozenset({
+            "action_id", "revision", "from_state", "to_state", "at",
+        }),
+    }
+
+    def _verify_v1_structure(self) -> None:
+        """A same-named table/index is not enough: verify required columns and
+        that idx_one_open_per_run is actually a UNIQUE partial index on run_id,
+        so a weaker legacy schema cannot masquerade as v1."""
+        for table, required in self._REQUIRED_COLUMNS.items():
+            cols = {
+                r[1]
+                for r in self._conn.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            absent = required - cols
+            if absent:
+                raise JournalCorruptError(
+                    f"table {table!r} missing columns: {sorted(absent)}"
+                )
+        index_list = self._conn.execute(
+            "PRAGMA index_list(actions)"
+        ).fetchall()
+        # PRAGMA index_list columns: seq, name, unique, origin, partial
+        match = next(
+            (r for r in index_list if r[1] == "idx_one_open_per_run"), None
+        )
+        if match is None:
             raise JournalCorruptError("schema missing idx_one_open_per_run")
+        unique = int(match[2])
+        partial = int(match[4]) if len(match) > 4 else 0
+        if unique != 1 or partial != 1:
+            raise JournalCorruptError(
+                "idx_one_open_per_run must be a UNIQUE partial index"
+            )
+        idx_cols = [
+            r[2]
+            for r in self._conn.execute(
+                "PRAGMA index_info(idx_one_open_per_run)"
+            ).fetchall()
+        ]
+        if idx_cols != ["run_id"]:
+            raise JournalCorruptError(
+                "idx_one_open_per_run must index exactly (run_id)"
+            )
 
     # -- transaction helper: any exception rolls back before propagating, so a
     # non-OperationalError (corrupt JSON, IntegrityError, CAS miss) can never
@@ -455,9 +511,11 @@ class SQLiteActionJournal:
                 raise
 
     def _create_schema(self) -> None:
-        self._conn.executescript(
+        # individual statements (not executescript, which would COMMIT and break
+        # the atomic create+version-stamp transaction in _init_schema).
+        self._conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS actions (
+            CREATE TABLE actions (
                 action_id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL,
                 action_sequence INTEGER NOT NULL,
@@ -485,21 +543,27 @@ class SQLiteActionJournal:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE (run_id, action_sequence)
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_per_run
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE UNIQUE INDEX idx_one_open_per_run
                 ON actions(run_id)
                 WHERE state IN
-                    ('PREPARED','DISPATCHING','EXECUTED','OUTCOME_UNKNOWN');
-
-            CREATE TABLE IF NOT EXISTS action_transitions (
+                    ('PREPARED','DISPATCHING','EXECUTED','OUTCOME_UNKNOWN')
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE action_transitions (
                 action_id TEXT NOT NULL,
                 revision INTEGER NOT NULL,
                 from_state TEXT,
                 to_state TEXT NOT NULL,
                 at TEXT NOT NULL,
                 PRIMARY KEY (action_id, revision)
-            );
+            )
             """
         )
 

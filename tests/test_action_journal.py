@@ -43,6 +43,7 @@ from mano.action_journal import (
     DuplicateActionError,
     IllegalTransitionError,
     ImmutableFieldError,
+    JournalBusyError,
     JournalCorruptError,
     RevisionConflictError,
     RunIdInvalidError,
@@ -543,6 +544,86 @@ def test_v1_missing_required_table_is_corrupt(tmp_path: Path) -> None:
     raw.close()
     with pytest.raises(JournalCorruptError):
         SQLiteActionJournal(db)
+
+
+def test_v1_missing_column_is_corrupt(tmp_path: Path) -> None:
+    db = str(tmp_path / "j.db")
+    SQLiteActionJournal(db).close()
+    raw = sqlite3.connect(db)
+    raw.execute("ALTER TABLE actions DROP COLUMN foreground")  # same name, weaker
+    raw.close()
+    with pytest.raises(JournalCorruptError):
+        SQLiteActionJournal(db)
+
+
+def test_v1_index_without_unique_partial_is_corrupt(tmp_path: Path) -> None:
+    db = str(tmp_path / "j.db")
+    SQLiteActionJournal(db).close()
+    raw = sqlite3.connect(db)
+    raw.execute("DROP INDEX idx_one_open_per_run")
+    raw.execute("CREATE INDEX idx_one_open_per_run ON actions(run_id)")
+    raw.close()
+    with pytest.raises(JournalCorruptError):
+        SQLiteActionJournal(db)
+
+
+def test_schema_init_failure_leaves_no_half_built_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = str(tmp_path / "j.db")
+    real_create = SQLiteActionJournal._create_schema
+
+    def boom(self: SQLiteActionJournal) -> None:
+        real_create(self)  # tables exist inside the txn...
+        raise RuntimeError("crash before the version stamp commits")
+
+    monkeypatch.setattr(SQLiteActionJournal, "_create_schema", boom)
+    with pytest.raises(RuntimeError):
+        SQLiteActionJournal(db)
+    monkeypatch.undo()
+    # the aborted txn must roll back fully: no "tables exist but version=0"
+    probe = sqlite3.connect(db)
+    try:
+        assert probe.execute("PRAGMA user_version").fetchone()[0] == 0
+        assert probe.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+        ).fetchone()[0] == 0
+    finally:
+        probe.close()
+    # and a fresh open now succeeds as a brand-new database
+    j = SQLiteActionJournal(db)
+    try:
+        assert j._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    finally:
+        j.close()
+
+
+# --- real lock contention maps to DB_BUSY (review 1711 #1) -------------------
+
+
+def test_write_under_lock_maps_to_db_busy(tmp_path: Path) -> None:
+    db = str(tmp_path / "j.db")
+    seed = SQLiteActionJournal(db)
+    seed.prepare(_intent(action_id="x"))
+    seed.close()
+    holder = SQLiteActionJournal(db)
+    contender = SQLiteActionJournal(db, busy_timeout_ms=0)
+    try:
+        holder._conn.execute("BEGIN IMMEDIATE")  # hold the write lock
+        with pytest.raises(JournalBusyError) as prep:
+            contender.prepare(_intent(run_id="run-2", action_id="y"))
+        assert prep.value.code == "DB_BUSY"
+        with pytest.raises(JournalBusyError) as trans:
+            contender.transition(
+                "x", expected_state=PREPARED, expected_revision=0,
+                new_state=DISPATCHING,
+            )
+        assert trans.value.code == "DB_BUSY"
+        assert contender._conn.in_transaction is False  # no leaked txn
+    finally:
+        holder._conn.execute("ROLLBACK")
+        holder.close()
+        contender.close()
 
 # --- append-only recovery refs ----------------------------------------------
 
