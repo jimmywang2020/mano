@@ -13,8 +13,10 @@ Commit B once the Runner is wired; it is intentionally absent here.
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -30,10 +32,13 @@ from mano.action_journal import (
     EXECUTION_CONFIRMED,
     FINALIZED,
     HOOK_IDEMPOTENT,
+    NOT_APPLIED,
     NOT_EXECUTED,
     OUTCOME_UNKNOWN,
     PREPARED,
+    UNKNOWN,
     ActionIntent,
+    ActionJournalError,
     ActiveActionError,
     DuplicateActionError,
     IllegalTransitionError,
@@ -41,6 +46,7 @@ from mano.action_journal import (
     JournalCorruptError,
     RevisionConflictError,
     RunIdInvalidError,
+    SchemaVersionError,
     SQLiteActionJournal,
 )
 
@@ -224,6 +230,193 @@ def test_reconciliation_keeps_possible_on_close(
     assert rec.reconciliation_verdict == ALREADY_APPLIED
     assert rec.dispatch_certainty == CERTAINTY_POSSIBLE  # never raised to CONFIRMED
 
+# --- state-specific patch constraints (review 1625 blocker 1) ----------------
+
+
+def _to_outcome_unknown(journal: SQLiteActionJournal, aid: str) -> None:
+    journal.prepare(_intent(action_id=aid))
+    journal.transition(
+        aid, expected_state=PREPARED, expected_revision=0, new_state=DISPATCHING
+    )
+    journal.transition(
+        aid, expected_state=DISPATCHING, expected_revision=1,
+        new_state=OUTCOME_UNKNOWN,
+    )
+
+
+def test_outcome_unknown_needs_concrete_verdict_to_finalize(
+    journal: SQLiteActionJournal,
+) -> None:
+    _to_outcome_unknown(journal, "a")
+    with pytest.raises(ActionJournalError):  # no verdict
+        journal.transition(
+            "a", expected_state=OUTCOME_UNKNOWN, expected_revision=2,
+            new_state=FINALIZED,
+        )
+    with pytest.raises(ActionJournalError):  # UNKNOWN cannot close
+        journal.transition(
+            "a", expected_state=OUTCOME_UNKNOWN, expected_revision=2,
+            new_state=FINALIZED, patch={"reconciliation_verdict": UNKNOWN},
+        )
+    assert journal.get_record("a").state == OUTCOME_UNKNOWN
+    # UNKNOWN may only keep it open (self-loop)
+    journal.transition(
+        "a", expected_state=OUTCOME_UNKNOWN, expected_revision=2,
+        new_state=OUTCOME_UNKNOWN, patch={"reconciliation_verdict": UNKNOWN},
+    )
+    # a concrete verdict closes it
+    journal.transition(
+        "a", expected_state=OUTCOME_UNKNOWN, expected_revision=3,
+        new_state=FINALIZED, patch={"reconciliation_verdict": NOT_APPLIED},
+    )
+    assert journal.get_record("a").state == FINALIZED
+
+
+def test_verdict_forbidden_on_non_reconcile_transition(
+    journal: SQLiteActionJournal,
+) -> None:
+    journal.prepare(_intent(action_id="a"))
+    with pytest.raises(ActionJournalError):
+        journal.transition(
+            "a", expected_state=PREPARED, expected_revision=0,
+            new_state=DISPATCHING,
+            patch={"reconciliation_verdict": ALREADY_APPLIED},
+        )
+    assert journal.get_record("a").state == PREPARED
+
+
+def test_hook_applied_must_be_strict_bool(journal: SQLiteActionJournal) -> None:
+    journal.prepare(_intent(action_id="a", hook_recovery=HOOK_IDEMPOTENT))
+    journal.transition(
+        "a", expected_state=PREPARED, expected_revision=0, new_state=DISPATCHING
+    )
+    journal.transition(
+        "a", expected_state=DISPATCHING, expected_revision=1, new_state=EXECUTED
+    )
+    for bad in ("false", 1, 0, None):
+        with pytest.raises(ActionJournalError):
+            journal.transition(
+                "a", expected_state=EXECUTED, expected_revision=2,
+                new_state=FINALIZED, patch={"hook_applied": bad},
+            )
+    assert journal.get_record("a").state == EXECUTED
+    journal.transition(
+        "a", expected_state=EXECUTED, expected_revision=2,
+        new_state=FINALIZED, patch={"hook_applied": True},
+    )
+    assert journal.get_record("a").hook_applied is True
+
+
+def test_hook_applied_only_on_executed_finalize(
+    journal: SQLiteActionJournal,
+) -> None:
+    journal.prepare(_intent(action_id="a"))
+    with pytest.raises(ActionJournalError):
+        journal.transition(
+            "a", expected_state=PREPARED, expected_revision=0,
+            new_state=DISPATCHING, patch={"hook_applied": True},
+        )
+
+
+def test_recovery_refs_must_be_list(journal: SQLiteActionJournal) -> None:
+    journal.prepare(_intent(action_id="a"))
+    with pytest.raises(ActionJournalError):
+        journal.transition(
+            "a", expected_state=PREPARED, expected_revision=0,
+            new_state=DISPATCHING, patch={"recovery_observation_refs": "x"},
+        )
+
+
+# --- unified transaction: no leaked write txn (review 1625 blocker 2) --------
+
+
+def test_corrupt_refs_convert_to_journal_corrupt_without_leaking_txn(
+    journal: SQLiteActionJournal,
+) -> None:
+    journal.prepare(_intent(action_id="a"))
+    # corrupt the persisted recovery refs to invalid JSON
+    journal._conn.execute(
+        "UPDATE actions SET recovery_observation_refs='{bad' WHERE action_id=?",
+        ("a",),
+    )
+    with pytest.raises(JournalCorruptError):
+        journal.transition(
+            "a", expected_state=PREPARED, expected_revision=0,
+            new_state=DISPATCHING,
+            patch={"recovery_observation_refs": ["y"]},
+        )
+    assert journal._conn.in_transaction is False  # rolled back, not locked
+
+
+# --- integrity (review 1625 blocker 3) ---------------------------------------
+
+
+def test_integrity_detects_revision_gap(journal: SQLiteActionJournal) -> None:
+    journal.prepare(_intent(action_id="a"))
+    journal._conn.execute(
+        "INSERT INTO action_transitions "
+        "(action_id, revision, from_state, to_state, at) VALUES (?,?,?,?,?)",
+        ("a", 5, PREPARED, DISPATCHING, "t"),
+    )
+    with pytest.raises(JournalCorruptError):
+        journal.verify_integrity("a")
+
+
+def test_integrity_detects_main_record_state_mismatch(
+    journal: SQLiteActionJournal,
+) -> None:
+    journal.prepare(_intent(action_id="a"))
+    journal._conn.execute(
+        "UPDATE actions SET state='DISPATCHING' WHERE action_id=?", ("a",)
+    )
+    with pytest.raises(JournalCorruptError):
+        journal.verify_integrity("a")
+
+
+def test_load_open_actions_rejects_corrupt_record(
+    journal: SQLiteActionJournal,
+) -> None:
+    journal.prepare(_intent(action_id="a"))
+    journal._conn.execute(
+        "UPDATE actions SET revision=9 WHERE action_id=?", ("a",)
+    )
+    with pytest.raises(JournalCorruptError):
+        journal.load_open_actions("run-1")
+
+
+# --- schema version ----------------------------------------------------------
+
+
+def test_schema_version_mismatch_refused(tmp_path: Path) -> None:
+    db = str(tmp_path / "journal.db")
+    SQLiteActionJournal(db).close()
+    raw = sqlite3.connect(db)
+    raw.execute("PRAGMA user_version=999")
+    raw.close()
+    with pytest.raises(SchemaVersionError):
+        SQLiteActionJournal(db)
+
+
+# --- intent input validation -------------------------------------------------
+
+
+def test_intent_rejects_blank_required_fields(
+    journal: SQLiteActionJournal,
+) -> None:
+    for kw in (
+        {"semantic_target": ""},
+        {"action_type": "  "},
+        {"execution_payload_hash": ""},
+    ):
+        with pytest.raises(ActionJournalError):
+            journal.prepare(_intent(**kw))
+
+
+def test_intent_rejects_non_list_refs(journal: SQLiteActionJournal) -> None:
+    with pytest.raises(ActionJournalError):
+        journal.prepare(
+            _intent(pre_execution_observation_refs="not-a-list")
+        )
 
 # --- append-only recovery refs ----------------------------------------------
 
@@ -423,3 +616,36 @@ def test_two_journals_same_path_one_open_wins(tmp_path: Path) -> None:
     finally:
         j1.close()
         j2.close()
+
+
+def test_concurrent_prepare_exactly_one_wins(tmp_path: Path) -> None:
+    db = str(tmp_path / "journal.db")
+    SQLiteActionJournal(db).close()  # create schema once, before the race
+    barrier = threading.Barrier(2)
+    results: dict[str, str] = {}
+
+    def worker(aid: str) -> None:
+        j = SQLiteActionJournal(db)
+        try:
+            barrier.wait()
+            j.prepare(_intent(run_id="run-c", action_id=aid))
+            results[aid] = "ok"
+        except ActiveActionError:
+            results[aid] = "rejected"
+        except Exception as exc:  # pragma: no cover - surfaces unexpected races
+            results[aid] = f"err:{exc!r}"
+        finally:
+            j.close()
+
+    t1 = threading.Thread(target=worker, args=("a",))
+    t2 = threading.Thread(target=worker, args=("b",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+    assert sorted(results.values()) == ["ok", "rejected"], results
+    winner = SQLiteActionJournal(db)
+    try:
+        assert len(winner.load_open_actions("run-c")) == 1
+    finally:
+        winner.close()

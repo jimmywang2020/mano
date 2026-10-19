@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Iterator, Protocol, runtime_checkable
 
 from .errors import ManoError
 
@@ -103,8 +104,23 @@ _PATCHABLE = frozenset(
     {"reconciliation_verdict", "hook_applied", "recovery_observation_refs"}
 )
 
+# Bumped whenever the on-disk schema changes; an existing DB with a different
+# user_version is refused rather than silently opened against incompatible code.
+_SCHEMA_VERSION = 1
 _CONTEXT_MAX_BYTES = 8192
+_REFS_MAX_BYTES = 16384
 _OPEN_SQL = ",".join(f"'{s}'" for s in sorted(OPEN_STATES))
+
+# The only dispatch_certainty values that are coherent with each state; used by
+# the integrity check to reject a record whose certainty was tampered with.
+_CERT_OK: dict[str, frozenset[str]] = {
+    PREPARED: frozenset({CERTAINTY_NONE}),
+    DISPATCHING: frozenset({CERTAINTY_POSSIBLE}),
+    EXECUTED: frozenset({CERTAINTY_CONFIRMED}),
+    NOT_EXECUTED: frozenset({CERTAINTY_NONE}),
+    OUTCOME_UNKNOWN: frozenset({CERTAINTY_POSSIBLE}),
+    FINALIZED: frozenset({CERTAINTY_CONFIRMED, CERTAINTY_POSSIBLE}),
+}
 _RECORD_COLS = (
     "run_id, action_sequence, action_id, revision, state, dispatch_certainty, "
     "reconciliation_verdict, hook_applied, hook_recovery, pack_id, pack_digest, "
@@ -154,6 +170,10 @@ class JournalBusyError(ActionJournalError):
 
 class JournalCorruptError(ActionJournalError):
     code = "JOURNAL_CORRUPT"
+
+
+class SchemaVersionError(ActionJournalError):
+    code = "SCHEMA_VERSION"
 
 
 # --- Value objects -----------------------------------------------------------
@@ -297,6 +317,20 @@ def _dump_context(ctx: dict[str, Any] | None) -> str | None:
     return text
 
 
+def _dump_refs(refs: Any) -> str:
+    if not isinstance(refs, list):
+        raise ActionJournalError("observation refs must be a JSON list")
+    try:
+        text = json.dumps(refs, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ActionJournalError(
+            f"observation refs not JSON-serializable: {exc}"
+        ) from exc
+    if len(text.encode("utf-8")) > _REFS_MAX_BYTES:
+        raise ActionJournalError("observation refs exceed size cap")
+    return text
+
+
 def _as_busy(exc: sqlite3.OperationalError) -> Exception:
     msg = str(exc).lower()
     if "locked" in msg or "busy" in msg:
@@ -317,22 +351,44 @@ class SQLiteActionJournal:
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self._create_schema()
+        self._check_schema_version()
 
     def close(self) -> None:
         self._conn.close()
 
-    # -- transaction helpers --
-    def _begin(self) -> None:
-        self._conn.execute("BEGIN IMMEDIATE")
+    def _check_schema_version(self) -> None:
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if version == 0:
+            self._conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+        elif version != _SCHEMA_VERSION:
+            raise SchemaVersionError(
+                f"unsupported journal schema version {version}, "
+                f"expected {_SCHEMA_VERSION}"
+            )
 
-    def _commit(self) -> None:
-        self._conn.execute("COMMIT")
-
+    # -- transaction helper: any exception rolls back before propagating, so a
+    # non-OperationalError (corrupt JSON, IntegrityError, CAS miss) can never
+    # leave the connection in an open transaction that locks later recovery.
     def _rollback(self) -> None:
         try:
             self._conn.execute("ROLLBACK")
         except sqlite3.OperationalError:
             pass
+
+    @contextmanager
+    def _txn(self) -> Iterator[None]:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._rollback()
+            raise
+        else:
+            try:
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._rollback()
+                raise
 
     def _create_schema(self) -> None:
         self._conn.executescript(
@@ -385,93 +441,77 @@ class SQLiteActionJournal:
 
     # -- API --
     def prepare(self, intent: ActionIntent) -> PreparedAction:
+        self._validate_intent(intent)
         run_id = intent.run_id
-        if not isinstance(run_id, str) or not run_id.strip():
-            raise RunIdInvalidError(
-                "run_id must be a non-empty, non-whitespace string"
-            )
-        if not isinstance(intent.action_id, str) or not intent.action_id.strip():
-            raise ActionJournalError("action_id must be a non-empty string")
-        if intent.hook_recovery not in ALL_HOOK_RECOVERY:
-            raise ActionJournalError(f"bad hook_recovery: {intent.hook_recovery!r}")
         ctx = _dump_context(intent.reconciliation_context)
-        pre_refs = json.dumps(list(intent.pre_execution_observation_refs or []))
+        pre_refs = _dump_refs(list(intent.pre_execution_observation_refs or []))
         now = _now()
         try:
-            self._begin()
-            dup = self._conn.execute(
-                "SELECT 1 FROM actions WHERE action_id=?", (intent.action_id,)
-            ).fetchone()
-            if dup is not None:
-                self._rollback()
-                raise DuplicateActionError(
-                    f"action_id already exists: {intent.action_id!r}"
-                )
-            open_row = self._conn.execute(
-                f"SELECT action_id FROM actions "
-                f"WHERE run_id=? AND state IN ({_OPEN_SQL})",
-                (run_id,),
-            ).fetchone()
-            if open_row is not None:
-                self._rollback()
-                raise ActiveActionError(
-                    f"run {run_id!r} already has an open action: {open_row[0]!r}"
-                )
-            seq = self._conn.execute(
-                "SELECT COALESCE(MAX(action_sequence),0)+1 "
-                "FROM actions WHERE run_id=?",
-                (run_id,),
-            ).fetchone()[0]
-            try:
-                self._conn.execute(
-                    "INSERT INTO actions ("
-                    "action_id, run_id, action_sequence, revision, state, "
-                    "dispatch_certainty, hook_recovery, pack_id, pack_digest, "
-                    "reconciliation_schema_version, semantic_target, action_type, "
-                    "execution_payload_hash, reconciliation_context, "
-                    "pre_execution_observation_refs, recovery_observation_refs, "
-                    "foreground, created_at, updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        intent.action_id,
-                        run_id,
-                        seq,
-                        0,
-                        PREPARED,
-                        CERTAINTY_NONE,
-                        intent.hook_recovery,
-                        intent.pack_id,
-                        intent.pack_digest,
-                        intent.reconciliation_schema_version,
-                        intent.semantic_target,
-                        intent.action_type,
-                        intent.execution_payload_hash,
-                        ctx,
-                        pre_refs,
-                        "[]",
-                        intent.foreground,
-                        now,
-                        now,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                self._rollback()
-                if "action_id" in str(exc).lower():
+            with self._txn():
+                dup = self._conn.execute(
+                    "SELECT 1 FROM actions WHERE action_id=?", (intent.action_id,)
+                ).fetchone()
+                if dup is not None:
                     raise DuplicateActionError(
                         f"action_id already exists: {intent.action_id!r}"
-                    ) from exc
-                raise ActiveActionError(
-                    f"concurrent open action for run {run_id!r}"
-                ) from exc
-            self._conn.execute(
-                "INSERT INTO action_transitions "
-                "(action_id, revision, from_state, to_state, at) "
-                "VALUES (?,?,?,?,?)",
-                (intent.action_id, 0, None, PREPARED, now),
-            )
-            self._commit()
+                    )
+                open_row = self._conn.execute(
+                    f"SELECT action_id FROM actions "
+                    f"WHERE run_id=? AND state IN ({_OPEN_SQL})",
+                    (run_id,),
+                ).fetchone()
+                if open_row is not None:
+                    raise ActiveActionError(
+                        f"run {run_id!r} already has an open action: "
+                        f"{open_row[0]!r}"
+                    )
+                seq = self._conn.execute(
+                    "SELECT COALESCE(MAX(action_sequence),0)+1 "
+                    "FROM actions WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()[0]
+                try:
+                    self._conn.execute(
+                        "INSERT INTO actions ("
+                        "action_id, run_id, action_sequence, revision, state, "
+                        "dispatch_certainty, hook_recovery, pack_id, pack_digest, "
+                        "reconciliation_schema_version, semantic_target, "
+                        "action_type, execution_payload_hash, "
+                        "reconciliation_context, pre_execution_observation_refs, "
+                        "recovery_observation_refs, foreground, created_at, "
+                        "updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            intent.action_id,
+                            run_id,
+                            seq,
+                            0,
+                            PREPARED,
+                            CERTAINTY_NONE,
+                            intent.hook_recovery,
+                            intent.pack_id,
+                            intent.pack_digest,
+                            intent.reconciliation_schema_version,
+                            intent.semantic_target,
+                            intent.action_type,
+                            intent.execution_payload_hash,
+                            ctx,
+                            pre_refs,
+                            "[]",
+                            intent.foreground,
+                            now,
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise self._map_integrity(exc, run_id, intent.action_id)
+                self._conn.execute(
+                    "INSERT INTO action_transitions "
+                    "(action_id, revision, from_state, to_state, at) "
+                    "VALUES (?,?,?,?,?)",
+                    (intent.action_id, 0, None, PREPARED, now),
+                )
         except sqlite3.OperationalError as exc:
-            self._rollback()
             raise _as_busy(exc)
         return PreparedAction(
             run_id=run_id,
@@ -480,6 +520,45 @@ class SQLiteActionJournal:
             revision=0,
             state=PREPARED,
         )
+
+    def _validate_intent(self, intent: ActionIntent) -> None:
+        if not isinstance(intent.run_id, str) or not intent.run_id.strip():
+            raise RunIdInvalidError(
+                "run_id must be a non-empty, non-whitespace string"
+            )
+        for name in (
+            "action_id",
+            "semantic_target",
+            "action_type",
+            "execution_payload_hash",
+        ):
+            value = getattr(intent, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ActionJournalError(f"{name} must be a non-empty string")
+        if not isinstance(intent.pre_execution_observation_refs, list):
+            raise ActionJournalError(
+                "pre_execution_observation_refs must be a list"
+            )
+        if intent.hook_recovery not in ALL_HOOK_RECOVERY:
+            raise ActionJournalError(f"bad hook_recovery: {intent.hook_recovery!r}")
+
+    def _map_integrity(
+        self, exc: sqlite3.IntegrityError, run_id: str, action_id: str
+    ) -> ActionJournalError:
+        msg = str(exc).lower()
+        if "action_id" in msg:
+            return DuplicateActionError(
+                f"action_id already exists: {action_id!r}"
+            )
+        if (
+            "idx_one_open_per_run" in msg
+            or "action_sequence" in msg
+            or "run_id" in msg
+        ):
+            return ActiveActionError(
+                f"concurrent open action for run {run_id!r}"
+            )
+        return ActionJournalError(f"integrity error: {exc}")
 
     def transition(
         self,
@@ -500,68 +579,110 @@ class SQLiteActionJournal:
             raise ImmutableFieldError(
                 f"fields not patchable by transition: {sorted(bad)}"
             )
-        if (
-            "reconciliation_verdict" in patch
-            and patch["reconciliation_verdict"] not in ALL_VERDICTS
-        ):
-            raise ActionJournalError(
-                f"bad reconciliation_verdict: {patch['reconciliation_verdict']!r}"
-            )
+        self._validate_patch(expected_state, new_state, patch)
         try:
-            self._begin()
-            row = self._conn.execute(
-                "SELECT state, revision, dispatch_certainty, "
-                "recovery_observation_refs FROM actions WHERE action_id=?",
-                (action_id,),
-            ).fetchone()
-            if row is None:
-                self._rollback()
-                raise RevisionConflictError(f"no such action_id: {action_id!r}")
-            cur_state, cur_rev, cur_cert, refs_json = row
-            new_cert = _certainty_for(new_state, cur_cert)
-            sets = [
-                "state=?",
-                "dispatch_certainty=?",
-                "revision=revision+1",
-                "updated_at=?",
-            ]
-            params: list[Any] = [new_state, new_cert, _now()]
-            if "reconciliation_verdict" in patch:
-                sets.append("reconciliation_verdict=?")
-                params.append(patch["reconciliation_verdict"])
-            if "hook_applied" in patch:
-                sets.append("hook_applied=?")
-                params.append(1 if patch["hook_applied"] else 0)
-            if "recovery_observation_refs" in patch:
-                existing = json.loads(refs_json or "[]")
-                existing.extend(patch["recovery_observation_refs"])
-                sets.append("recovery_observation_refs=?")
-                params.append(json.dumps(existing))
-            params.extend([action_id, expected_state, expected_revision])
-            cur = self._conn.execute(
-                f"UPDATE actions SET {', '.join(sets)} "
-                "WHERE action_id=? AND state=? AND revision=?",
-                params,
-            )
-            if cur.rowcount != 1:
-                self._rollback()
-                raise RevisionConflictError(
-                    f"CAS failed for {action_id!r}: expected "
-                    f"{expected_state}@{expected_revision}, "
-                    f"found {cur_state}@{cur_rev}"
+            with self._txn():
+                row = self._conn.execute(
+                    "SELECT state, revision, dispatch_certainty, "
+                    "recovery_observation_refs FROM actions WHERE action_id=?",
+                    (action_id,),
+                ).fetchone()
+                if row is None:
+                    raise RevisionConflictError(
+                        f"no such action_id: {action_id!r}"
+                    )
+                cur_state, cur_rev, cur_cert, refs_json = row
+                new_cert = _certainty_for(new_state, cur_cert)
+                sets = [
+                    "state=?",
+                    "dispatch_certainty=?",
+                    "revision=revision+1",
+                    "updated_at=?",
+                ]
+                params: list[Any] = [new_state, new_cert, _now()]
+                if "reconciliation_verdict" in patch:
+                    sets.append("reconciliation_verdict=?")
+                    params.append(patch["reconciliation_verdict"])
+                if "hook_applied" in patch:
+                    sets.append("hook_applied=?")
+                    params.append(1 if patch["hook_applied"] else 0)
+                if "recovery_observation_refs" in patch:
+                    try:
+                        existing = json.loads(refs_json or "[]")
+                    except json.JSONDecodeError as exc:
+                        raise JournalCorruptError(
+                            f"recovery refs corrupt for {action_id!r}"
+                        ) from exc
+                    if not isinstance(existing, list):
+                        raise JournalCorruptError(
+                            f"recovery refs not a list for {action_id!r}"
+                        )
+                    existing.extend(patch["recovery_observation_refs"])
+                    sets.append("recovery_observation_refs=?")
+                    params.append(_dump_refs(existing))
+                params.extend([action_id, expected_state, expected_revision])
+                cur = self._conn.execute(
+                    f"UPDATE actions SET {', '.join(sets)} "
+                    "WHERE action_id=? AND state=? AND revision=?",
+                    params,
                 )
-            new_rev = expected_revision + 1
-            self._conn.execute(
-                "INSERT INTO action_transitions "
-                "(action_id, revision, from_state, to_state, at) "
-                "VALUES (?,?,?,?,?)",
-                (action_id, new_rev, expected_state, new_state, _now()),
-            )
-            self._commit()
+                if cur.rowcount != 1:
+                    raise RevisionConflictError(
+                        f"CAS failed for {action_id!r}: expected "
+                        f"{expected_state}@{expected_revision}, "
+                        f"found {cur_state}@{cur_rev}"
+                    )
+                new_rev = expected_revision + 1
+                self._conn.execute(
+                    "INSERT INTO action_transitions "
+                    "(action_id, revision, from_state, to_state, at) "
+                    "VALUES (?,?,?,?,?)",
+                    (action_id, new_rev, expected_state, new_state, _now()),
+                )
         except sqlite3.OperationalError as exc:
-            self._rollback()
             raise _as_busy(exc)
         return new_rev
+
+    def _validate_patch(
+        self, expected_state: str, new_state: str, patch: dict[str, Any]
+    ) -> None:
+        """Reject patch content that would record an untrue fact: a verdict on a
+        non-reconciliation edge, closing the ambiguous window without a concrete
+        verdict, a non-bool hook_applied, or malformed recovery refs."""
+        if "reconciliation_verdict" in patch:
+            verdict = patch["reconciliation_verdict"]
+            if verdict not in ALL_VERDICTS:
+                raise ActionJournalError(
+                    f"bad reconciliation_verdict: {verdict!r}"
+                )
+            if expected_state != OUTCOME_UNKNOWN:
+                raise ActionJournalError(
+                    "reconciliation_verdict only on OUTCOME_UNKNOWN transitions"
+                )
+        if expected_state == OUTCOME_UNKNOWN and new_state == FINALIZED:
+            if patch.get("reconciliation_verdict") not in (
+                ALREADY_APPLIED,
+                NOT_APPLIED,
+            ):
+                raise ActionJournalError(
+                    "OUTCOME_UNKNOWN -> FINALIZED requires ALREADY_APPLIED or "
+                    "NOT_APPLIED"
+                )
+        if expected_state == OUTCOME_UNKNOWN and new_state == OUTCOME_UNKNOWN:
+            verdict = patch.get("reconciliation_verdict")
+            if verdict is not None and verdict != UNKNOWN:
+                raise ActionJournalError(
+                    "OUTCOME_UNKNOWN kept open may only carry UNKNOWN"
+                )
+        if "hook_applied" in patch:
+            if not isinstance(patch["hook_applied"], bool):
+                raise ActionJournalError("hook_applied must be a bool")
+            if not (expected_state == EXECUTED and new_state == FINALIZED):
+                raise ActionJournalError(
+                    "hook_applied only on EXECUTED -> FINALIZED"
+                )
+        if "recovery_observation_refs" in patch:
+            _dump_refs(patch["recovery_observation_refs"])
 
     def load_open_actions(self, run_id: str) -> list[ActionRecord]:
         rows = self._conn.execute(
@@ -570,7 +691,15 @@ class SQLiteActionJournal:
             "ORDER BY action_sequence",
             (run_id,),
         ).fetchall()
-        return [self._row_to_record(r) for r in rows]
+        if len(rows) > 1:
+            raise JournalCorruptError(
+                f"run {run_id!r} has {len(rows)} open actions"
+            )
+        records = [self._row_to_record(r) for r in rows]
+        # A corrupt open record must never flow into recovery; verify before use.
+        for rec in records:
+            self.verify_integrity(rec.action_id)
+        return records
 
     def get_record(self, action_id: str) -> ActionRecord | None:
         row = self._conn.execute(
@@ -600,25 +729,88 @@ class SQLiteActionJournal:
         )
 
     def verify_integrity(self, action_id: str) -> None:
-        """Walk the persisted transition chain and raise ``JournalCorruptError``
-        if any recorded adjacency is not a legal transition."""
+        """Full-chain integrity: contiguous revisions from 0, each ``to_state``
+        feeding the next ``from_state`` along a legal edge, the main record's
+        state/revision matching the last transition, certainty coherent with the
+        state, and verdict / hook_applied / refs well-typed. Any violation raises
+        ``JournalCorruptError`` so a corrupt record never reaches recovery."""
         rows = self._conn.execute(
-            "SELECT from_state, to_state FROM action_transitions "
+            "SELECT from_state, to_state, revision FROM action_transitions "
             "WHERE action_id=? ORDER BY revision",
             (action_id,),
         ).fetchall()
         if not rows:
             raise JournalCorruptError(f"no transition history: {action_id!r}")
-        for from_state, to_state in rows:
-            if from_state is None:
-                if to_state != PREPARED:
-                    raise JournalCorruptError(
-                        f"chain must open at PREPARED, got {to_state!r}"
-                    )
-                continue
-            if (from_state, to_state) not in LEGAL_TRANSITIONS:
+        prev_to: str | None = None
+        for i, (from_state, to_state, rev) in enumerate(rows):
+            if rev != i:
                 raise JournalCorruptError(
-                    f"illegal persisted transition {from_state!r} -> {to_state!r}"
+                    f"non-contiguous revision {rev} at position {i} "
+                    f"for {action_id!r}"
+                )
+            if to_state not in ALL_STATES:
+                raise JournalCorruptError(
+                    f"unknown to_state {to_state!r} for {action_id!r}"
+                )
+            if i == 0:
+                if from_state is not None or to_state != PREPARED:
+                    raise JournalCorruptError(
+                        f"chain must open None -> PREPARED for {action_id!r}"
+                    )
+            else:
+                if from_state != prev_to:
+                    raise JournalCorruptError(
+                        f"chain break {prev_to!r} != {from_state!r} "
+                        f"for {action_id!r}"
+                    )
+                if (from_state, to_state) not in LEGAL_TRANSITIONS:
+                    raise JournalCorruptError(
+                        f"illegal persisted transition "
+                        f"{from_state!r} -> {to_state!r}"
+                    )
+            prev_to = to_state
+        last_to, last_rev = rows[-1][1], rows[-1][2]
+        rec = self._conn.execute(
+            "SELECT state, revision, dispatch_certainty, reconciliation_verdict, "
+            "hook_applied, pre_execution_observation_refs, "
+            "recovery_observation_refs FROM actions WHERE action_id=?",
+            (action_id,),
+        ).fetchone()
+        if rec is None:
+            raise JournalCorruptError(f"no main record for {action_id!r}")
+        state, revision, certainty, verdict, hook_applied, pre_refs, rec_refs = rec
+        if state != last_to:
+            raise JournalCorruptError(
+                f"main state {state!r} != last transition {last_to!r} "
+                f"for {action_id!r}"
+            )
+        if revision != last_rev:
+            raise JournalCorruptError(
+                f"main revision {revision} != last transition {last_rev} "
+                f"for {action_id!r}"
+            )
+        if certainty not in _CERT_OK.get(state, frozenset()):
+            raise JournalCorruptError(
+                f"certainty {certainty!r} incompatible with state {state!r}"
+            )
+        if verdict is not None and verdict not in ALL_VERDICTS:
+            raise JournalCorruptError(
+                f"bad verdict {verdict!r} for {action_id!r}"
+            )
+        if hook_applied is not None and hook_applied not in (0, 1):
+            raise JournalCorruptError(
+                f"bad hook_applied {hook_applied!r} for {action_id!r}"
+            )
+        for label, refs_json in (("pre", pre_refs), ("recovery", rec_refs)):
+            try:
+                value = json.loads(refs_json or "[]")
+            except json.JSONDecodeError as exc:
+                raise JournalCorruptError(
+                    f"{label} refs corrupt for {action_id!r}"
+                ) from exc
+            if not isinstance(value, list):
+                raise JournalCorruptError(
+                    f"{label} refs not a list for {action_id!r}"
                 )
 
     def _row_to_record(self, row: tuple[Any, ...]) -> ActionRecord:
