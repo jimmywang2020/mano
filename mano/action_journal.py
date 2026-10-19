@@ -306,6 +306,8 @@ def _now() -> str:
 def _dump_context(ctx: dict[str, Any] | None) -> str | None:
     if ctx is None:
         return None
+    if not isinstance(ctx, dict):
+        raise ActionJournalError("reconciliation_context must be a dict or None")
     try:
         text = json.dumps(ctx, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
@@ -331,7 +333,44 @@ def _dump_refs(refs: Any) -> str:
     return text
 
 
-def _as_busy(exc: sqlite3.OperationalError) -> Exception:
+def _load_refs(raw: str | None, *, label: str, action_id: str) -> list[Any]:
+    """Decode persisted observation refs, mapping any corruption (bad JSON,
+    wrong type, oversize) to JournalCorruptError so a recovery read never leaks a
+    bare JSONDecodeError."""
+    text = raw or "[]"
+    if len(text.encode("utf-8")) > _REFS_MAX_BYTES:
+        raise JournalCorruptError(
+            f"{label} refs exceed size cap for {action_id!r}"
+        )
+    try:
+        value = json.loads(text)
+    except (ValueError, TypeError) as exc:
+        raise JournalCorruptError(
+            f"{label} refs corrupt for {action_id!r}"
+        ) from exc
+    if not isinstance(value, list):
+        raise JournalCorruptError(f"{label} refs not a list for {action_id!r}")
+    return value
+
+
+def _load_context(raw: str | None, *, action_id: str) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if len(raw.encode("utf-8")) > _CONTEXT_MAX_BYTES:
+        raise JournalCorruptError(
+            f"reconciliation_context exceeds size cap for {action_id!r}"
+        )
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise JournalCorruptError(
+            f"reconciliation_context corrupt for {action_id!r}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise JournalCorruptError(
+            f"reconciliation_context not a dict for {action_id!r}"
+        )
+    return value
     msg = str(exc).lower()
     if "locked" in msg or "busy" in msg:
         return JournalBusyError(str(exc))
@@ -350,21 +389,46 @@ class SQLiteActionJournal:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
-        self._create_schema()
-        self._check_schema_version()
+        self._init_schema()
 
     def close(self) -> None:
         self._conn.close()
 
-    def _check_schema_version(self) -> None:
+    def _init_schema(self) -> None:
+        """Check version and structure *before* any DDL: only a truly empty
+        database (no tables, version 0) is created and atomically claimed as v1.
+        A non-empty unmarked database (version 0 with tables), an unknown
+        version, or a v1 database missing required objects is refused without
+        modifying it."""
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version == 0:
+        tables = {
+            r[0]
+            for r in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if version == 0 and not tables:
+            self._create_schema()
             self._conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
-        elif version != _SCHEMA_VERSION:
+            return
+        if version != _SCHEMA_VERSION:
             raise SchemaVersionError(
                 f"unsupported journal schema version {version}, "
                 f"expected {_SCHEMA_VERSION}"
             )
+        missing = {"actions", "action_transitions"} - tables
+        if missing:
+            raise JournalCorruptError(
+                f"schema v{version} missing tables: {sorted(missing)}"
+            )
+        indexes = {
+            r[0]
+            for r in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        if "idx_one_open_per_run" not in indexes:
+            raise JournalCorruptError("schema missing idx_one_open_per_run")
 
     # -- transaction helper: any exception rolls back before propagating, so a
     # non-OperationalError (corrupt JSON, IntegrityError, CAS miss) can never
@@ -583,7 +647,7 @@ class SQLiteActionJournal:
         try:
             with self._txn():
                 row = self._conn.execute(
-                    "SELECT state, revision, dispatch_certainty, "
+                    "SELECT state, revision, dispatch_certainty, hook_recovery, "
                     "recovery_observation_refs FROM actions WHERE action_id=?",
                     (action_id,),
                 ).fetchone()
@@ -591,7 +655,11 @@ class SQLiteActionJournal:
                     raise RevisionConflictError(
                         f"no such action_id: {action_id!r}"
                     )
-                cur_state, cur_rev, cur_cert, refs_json = row
+                cur_state, cur_rev, cur_cert, hook_recovery, refs_json = row
+                if expected_state == EXECUTED and new_state == FINALIZED:
+                    self._check_hook_close(
+                        hook_recovery, patch.get("hook_applied")
+                    )
                 new_cert = _certainty_for(new_state, cur_cert)
                 sets = [
                     "state=?",
@@ -607,16 +675,9 @@ class SQLiteActionJournal:
                     sets.append("hook_applied=?")
                     params.append(1 if patch["hook_applied"] else 0)
                 if "recovery_observation_refs" in patch:
-                    try:
-                        existing = json.loads(refs_json or "[]")
-                    except json.JSONDecodeError as exc:
-                        raise JournalCorruptError(
-                            f"recovery refs corrupt for {action_id!r}"
-                        ) from exc
-                    if not isinstance(existing, list):
-                        raise JournalCorruptError(
-                            f"recovery refs not a list for {action_id!r}"
-                        )
+                    existing = _load_refs(
+                        refs_json, label="recovery", action_id=action_id
+                    )
                     existing.extend(patch["recovery_observation_refs"])
                     sets.append("recovery_observation_refs=?")
                     params.append(_dump_refs(existing))
@@ -683,6 +744,21 @@ class SQLiteActionJournal:
                 )
         if "recovery_observation_refs" in patch:
             _dump_refs(patch["recovery_observation_refs"])
+
+    @staticmethod
+    def _check_hook_close(hook_recovery: str, hook_applied: Any) -> None:
+        """A CONFIRMED close (EXECUTED -> FINALIZED) must record a hook fact that
+        matches the declared recovery kind: no hook means not applied, a declared
+        hook means it actually ran."""
+        if hook_recovery == HOOK_NOT_APPLICABLE:
+            if hook_applied is not False:
+                raise ActionJournalError(
+                    "NOT_APPLICABLE close requires hook_applied=False"
+                )
+        elif hook_applied is not True:
+            raise ActionJournalError(
+                f"{hook_recovery} close requires hook_applied=True"
+            )
 
     def load_open_actions(self, run_id: str) -> list[ActionRecord]:
         rows = self._conn.execute(
@@ -772,13 +848,22 @@ class SQLiteActionJournal:
         last_to, last_rev = rows[-1][1], rows[-1][2]
         rec = self._conn.execute(
             "SELECT state, revision, dispatch_certainty, reconciliation_verdict, "
-            "hook_applied, pre_execution_observation_refs, "
+            "hook_applied, hook_recovery, pre_execution_observation_refs, "
             "recovery_observation_refs FROM actions WHERE action_id=?",
             (action_id,),
         ).fetchone()
         if rec is None:
             raise JournalCorruptError(f"no main record for {action_id!r}")
-        state, revision, certainty, verdict, hook_applied, pre_refs, rec_refs = rec
+        (
+            state,
+            revision,
+            certainty,
+            verdict,
+            hook_applied,
+            hook_recovery,
+            pre_refs,
+            rec_refs,
+        ) = rec
         if state != last_to:
             raise JournalCorruptError(
                 f"main state {state!r} != last transition {last_to!r} "
@@ -801,17 +886,24 @@ class SQLiteActionJournal:
             raise JournalCorruptError(
                 f"bad hook_applied {hook_applied!r} for {action_id!r}"
             )
-        for label, refs_json in (("pre", pre_refs), ("recovery", rec_refs)):
-            try:
-                value = json.loads(refs_json or "[]")
-            except json.JSONDecodeError as exc:
+        if state == FINALIZED:
+            if certainty == CERTAINTY_CONFIRMED:
+                expected = 0 if hook_recovery == HOOK_NOT_APPLICABLE else 1
+                if hook_applied != expected:
+                    raise JournalCorruptError(
+                        f"FINALIZED/{hook_recovery} has incompatible "
+                        f"hook_applied {hook_applied!r} for {action_id!r}"
+                    )
+            elif certainty == CERTAINTY_POSSIBLE and verdict not in (
+                ALREADY_APPLIED,
+                NOT_APPLIED,
+            ):
                 raise JournalCorruptError(
-                    f"{label} refs corrupt for {action_id!r}"
-                ) from exc
-            if not isinstance(value, list):
-                raise JournalCorruptError(
-                    f"{label} refs not a list for {action_id!r}"
+                    f"reconciliation-closed FINALIZED needs a concrete "
+                    f"verdict for {action_id!r}"
                 )
+        _load_refs(pre_refs, label="pre", action_id=action_id)
+        _load_refs(rec_refs, label="recovery", action_id=action_id)
 
     def _row_to_record(self, row: tuple[Any, ...]) -> ActionRecord:
         (
@@ -855,13 +947,15 @@ class SQLiteActionJournal:
             semantic_target=semantic_target,
             action_type=action_type,
             execution_payload_hash=execution_payload_hash,
-            reconciliation_context=(
-                json.loads(reconciliation_context)
-                if reconciliation_context is not None
-                else None
+            reconciliation_context=_load_context(
+                reconciliation_context, action_id=action_id
             ),
-            pre_execution_observation_refs=json.loads(pre_refs or "[]"),
-            recovery_observation_refs=json.loads(recovery_refs or "[]"),
+            pre_execution_observation_refs=_load_refs(
+                pre_refs, label="pre", action_id=action_id
+            ),
+            recovery_observation_refs=_load_refs(
+                recovery_refs, label="recovery", action_id=action_id
+            ),
             foreground=foreground,
             created_at=created_at,
             updated_at=updated_at,

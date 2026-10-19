@@ -151,7 +151,8 @@ def test_happy_path_certainty_lattice(journal: SQLiteActionJournal) -> None:
     assert r2 == 2
     assert journal.get_record("a").dispatch_certainty == CERTAINTY_CONFIRMED
     r3 = journal.transition(
-        "a", expected_state=EXECUTED, expected_revision=2, new_state=FINALIZED
+        "a", expected_state=EXECUTED, expected_revision=2, new_state=FINALIZED,
+        patch={"hook_applied": False},
     )
     assert r3 == 3
     rec = journal.get_record("a")
@@ -417,6 +418,131 @@ def test_intent_rejects_non_list_refs(journal: SQLiteActionJournal) -> None:
         journal.prepare(
             _intent(pre_execution_observation_refs="not-a-list")
         )
+
+
+def test_intent_rejects_non_dict_context(journal: SQLiteActionJournal) -> None:
+    with pytest.raises(ActionJournalError):
+        journal.prepare(_intent(reconciliation_context=[1, 2]))
+
+
+# --- persisted JSON corruption surfaces JOURNAL_CORRUPT (review 1646 #1) -----
+
+
+def test_corrupt_context_reads_as_journal_corrupt(
+    journal: SQLiteActionJournal,
+) -> None:
+    journal.prepare(_intent(action_id="a", reconciliation_context={"k": "v"}))
+    journal._conn.execute(
+        "UPDATE actions SET reconciliation_context='{bad' WHERE action_id=?",
+        ("a",),
+    )
+    with pytest.raises(JournalCorruptError):
+        journal.get_record("a")
+    with pytest.raises(JournalCorruptError):
+        journal.load_open_actions("run-1")
+
+
+def test_corrupt_pre_refs_reads_as_journal_corrupt(
+    journal: SQLiteActionJournal,
+) -> None:
+    journal.prepare(_intent(action_id="a"))
+    journal._conn.execute(
+        "UPDATE actions SET pre_execution_observation_refs='{bad' "
+        "WHERE action_id=?",
+        ("a",),
+    )
+    with pytest.raises(JournalCorruptError):
+        journal.get_record("a")
+    with pytest.raises(JournalCorruptError):
+        journal.build_recovery_report("a")
+
+
+# --- hook_recovery / hook_applied close consistency (review 1646 #3) ---------
+
+
+def _to_executed(journal: SQLiteActionJournal, aid: str, hook: str) -> None:
+    journal.prepare(_intent(action_id=aid, hook_recovery=hook))
+    journal.transition(
+        aid, expected_state=PREPARED, expected_revision=0, new_state=DISPATCHING
+    )
+    journal.transition(
+        aid, expected_state=DISPATCHING, expected_revision=1, new_state=EXECUTED
+    )
+
+
+def test_not_applicable_close_requires_false(
+    journal: SQLiteActionJournal,
+) -> None:
+    from mano.action_journal import HOOK_NOT_APPLICABLE
+
+    _to_executed(journal, "a", HOOK_NOT_APPLICABLE)
+    with pytest.raises(ActionJournalError):  # no hook fact
+        journal.transition(
+            "a", expected_state=EXECUTED, expected_revision=2, new_state=FINALIZED
+        )
+    with pytest.raises(ActionJournalError):  # cannot claim a hook ran
+        journal.transition(
+            "a", expected_state=EXECUTED, expected_revision=2,
+            new_state=FINALIZED, patch={"hook_applied": True},
+        )
+    assert journal.get_record("a").state == EXECUTED
+    journal.transition(
+        "a", expected_state=EXECUTED, expected_revision=2,
+        new_state=FINALIZED, patch={"hook_applied": False},
+    )
+    assert journal.get_record("a").state == FINALIZED
+
+
+def test_declared_hook_close_requires_true(
+    journal: SQLiteActionJournal,
+) -> None:
+    _to_executed(journal, "a", HOOK_IDEMPOTENT)
+    with pytest.raises(ActionJournalError):  # missing hook fact
+        journal.transition(
+            "a", expected_state=EXECUTED, expected_revision=2, new_state=FINALIZED
+        )
+    with pytest.raises(ActionJournalError):  # a declared hook must have run
+        journal.transition(
+            "a", expected_state=EXECUTED, expected_revision=2,
+            new_state=FINALIZED, patch={"hook_applied": False},
+        )
+    journal.transition(
+        "a", expected_state=EXECUTED, expected_revision=2,
+        new_state=FINALIZED, patch={"hook_applied": True},
+    )
+    assert journal.get_record("a").hook_applied is True
+
+
+# --- schema version checked before any DDL (review 1646 #2) ------------------
+
+
+def test_unmarked_nonempty_db_refused_without_ddl(tmp_path: Path) -> None:
+    db = str(tmp_path / "legacy.db")
+    raw = sqlite3.connect(db)
+    raw.execute("CREATE TABLE legacy(x)")
+    raw.execute("PRAGMA user_version=0")
+    before = raw.execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+    raw.close()
+    with pytest.raises(SchemaVersionError):
+        SQLiteActionJournal(db)
+    raw = sqlite3.connect(db)
+    after = raw.execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+    raw.close()
+    assert before == after  # refusal must not run any DDL
+
+
+def test_v1_missing_required_table_is_corrupt(tmp_path: Path) -> None:
+    db = str(tmp_path / "j.db")
+    SQLiteActionJournal(db).close()
+    raw = sqlite3.connect(db)
+    raw.execute("DROP TABLE action_transitions")
+    raw.close()
+    with pytest.raises(JournalCorruptError):
+        SQLiteActionJournal(db)
 
 # --- append-only recovery refs ----------------------------------------------
 
