@@ -1,15 +1,18 @@
-# P0 Action Journal — Design (Round 1: design only)
+# P0 Action Journal — Design (Round 1d: approved for Round-2)
 
-> **Status: DESIGN / REVISED (round 1b). No runner behavior changes this round.**
-> This document is the P0 deliverable. Implementation (SQLite reference +
-> failure matrix) follows only after this design is approved.
+> **Status: DESIGN APPROVED (round 1d). Round-2 implementation authorized.**
+> This document is the P0 design deliverable. Round-2 (SQLite reference +
+> Runner wiring + failure matrix) is approved per《mano开发设计评审_1019_1520》;
+> the four round-1d closure items (§12) are implemented in code and tests.
 > Source:《mano调用反馈_1016_1704》+《mano开发设计评审_1016_1724》, revised
 > per《mano开发设计评审_1019_1448》(full transition table, cross-Runner
 > uniqueness, recovery-before-new-action entry, dispatch_certainty rename,
-> reconciliation_context / schema_version, RECONCILIATION_UNAVAILABLE) and
+> reconciliation_context / schema_version, RECONCILIATION_UNAVAILABLE),
 >《mano开发计划评审_1019_1505》(atomic no-open-action prepare, reconciliation
 > never rewrites dispatch_certainty, hook NOT_APPLICABLE + ABI migration,
-> split pre/recovery observation refs).
+> split pre/recovery observation refs), and《mano开发设计评审_1019_1520》
+> (dispatch_certainty not literal write-once, FINALIZED = safely-closed,
+> Consumer-supplied stable run_id, machine-checkable hook rule).
 
 ## 1. Problem statement
 
@@ -53,23 +56,26 @@ explicit `dispatch_certainty`.
 PREPARED        action intent durably persisted; ADB NOT yet permitted
 DISPATCHING     durably recorded "about to enter the external side-effect window"
 EXECUTED        ADB dispatch returned success; Pack post-processing (hook) may be pending
-FINALIZED       Core execution record AND Pack post-processing both complete
+FINALIZED       journal safely closed; no recovery needed (close path = certainty + verdict + hook_applied)
 NOT_EXECUTED    proven no device dispatch occurred
 OUTCOME_UNKNOWN ADB timeout / disconnect / ambiguous; dispatch MAY have happened
 ```
 
-`dispatch_certainty ∈ { NONE, POSSIBLE, CONFIRMED }` is a **write-once** fact set
-by the dispatch-determining transition and **never rewritten** afterwards. It
-describes only whether the ADB command was *dispatched* — **not** whether the
-target app's semantic effect occurred (a `tap` dispatch can succeed without the
-filter actually toggling). The *semantic* question is answered separately by the
-Pack's `reconciliation_verdict` (§6), stored on its own field; it **must not**
-rewrite `dispatch_certainty`.
+`dispatch_certainty ∈ { NONE, POSSIBLE, CONFIRMED }` is **Core-owned**: it is
+updated **only** by legal Core execution-state transitions along the certainty
+lattice `NONE → POSSIBLE → CONFIRMED` (plus `POSSIBLE → NONE` on a Core-proven
+clean pre-ADB refusal, `DISPATCHING → NOT_EXECUTED`). It is therefore **not** a
+literal write-once field, but **Pack reconciliation during recovery MUST NOT
+modify it**. It describes only whether the ADB command was *dispatched* —
+**not** whether the target app's semantic effect occurred (a `tap` dispatch can
+succeed without the filter actually toggling). The *semantic* question is
+answered separately by the Pack's `reconciliation_verdict` (§6), stored on its
+own field; it **must not** rewrite `dispatch_certainty`.
 
 | state | dispatch_certainty |
 |---|---|
 | `PREPARED` | `NONE` |
-| `DISPATCHING` | `POSSIBLE` (write-once; the blurry window stays POSSIBLE forever) |
+| `DISPATCHING` | `POSSIBLE` (Core-set; the blurry window stays POSSIBLE forever — reconciliation never changes it) |
 | `EXECUTED` | `CONFIRMED` |
 | `NOT_EXECUTED` | `NONE` (only when Core can PROVE no dispatch) |
 | `OUTCOME_UNKNOWN` | `POSSIBLE` (inherited; reconciliation never lowers/raises it) |
@@ -225,17 +231,21 @@ def reconcile_action(
 
 Covers: `ADB success -> EXECUTED durable -> SIGKILL before the hook runs`.
 
-- A Pack MUST declare `hook_recovery = IDEMPOTENT | NOT_REPLAYABLE | NOT_APPLICABLE`
-  (Core reads this; it is **not** merely documented).
-- `NOT_APPLICABLE`: the Pack exposes no `on_action_executed` hook; on reaching
-  `EXECUTED` Core closes **directly to `FINALIZED`** with no hook replay. (The
-  current Pack Protocol makes the hook optional, so this is the default when the
-  attribute is absent.)
+Core resolves `hook_recovery` with a **machine-checkable** rule (not mere docs):
+
+- **No `on_action_executed` hook** -> default `NOT_APPLICABLE`; on reaching
+  `EXECUTED` Core closes **directly to `FINALIZED`** with no hook replay.
+- **Hook present** -> the Pack MUST explicitly declare `IDEMPOTENT` or
+  `NOT_REPLAYABLE`. A hook present but declared (or left) `NOT_APPLICABLE` is a
+  **Pack configuration error -> fail closed**: the Runner refuses to enable the
+  journal rather than silently skip hook recovery.
 - `IDEMPOTENT`: on recovery with `EXECUTED` but not `FINALIZED`, Core **replays
   the hook only, never the ADB action** (passing the stable `action_id` and
   `recovery=True`), then transitions to `FINALIZED`.
 - `NOT_REPLAYABLE`: recovery result is `UNKNOWN`, the hook is **not** replayed,
   the ADB action is **never** replayed, and the Consumer decides.
+- `recovery_observation_refs` are **appended**, never overwriting earlier refs on
+  repeated `UNKNOWN` reconciliation passes.
 - Core records `hook_applied` on `FINALIZED`.
 - **Round-2 hook ABI migration (not this round):** the hook today is
   `on_action_executed(*, executed: ResolvedAction)`. Passing `action_id` +
@@ -316,6 +326,13 @@ Requirements:
   run — even with different `action_id`s — let exactly one win; the other is
   rejected. The Runner MUST resolve all open actions (§5 recovery entry) before
   `prepare()`-ing the next one.
+- **Stable `run_id` is Consumer-supplied.** When the journal is enabled the
+  Consumer MUST pass an explicit, stable `run_id`; crash recovery can find the
+  prior open action **only** by reusing the **same** `run_id`. Core MUST NOT
+  re-randomize a `run_id` per process start, and MUST **refuse to enable the
+  journal** (fail closed) when `run_id` is missing or empty. `mano.runner.run()`
+  gains a required `run_id` parameter in Round-2 (today it has none); a journal
+  without a stable `run_id` is disabled, not silently self-named.
 - `transition()` MUST atomically check `expected_state` **and**
   `expected_revision` before applying; mismatch raises (no silent overwrite).
 - SQLite reference impl: real transactions + `PRAGMA journal_mode=WAL`,
@@ -360,6 +377,11 @@ Unit-level exception injection is insufficient. The matrix MUST include:
 10. two Runners `prepare()` the same run **concurrently with different
     `action_id`s** -> exactly one wins (atomic no-open-action check), the other
     is rejected; the single device action is never double-dispatched.
+11. **new process resumes with the original `run_id`**: after SIGKILL, a fresh
+    Runner started with the **same** Consumer-supplied `run_id` finds the prior
+    open action via `load_open_actions(run_id)`; a run started with a different
+    or empty `run_id` refuses to enable the journal (fail closed) and never
+    resumes the stale action.
 
 At least one case MUST use a **real subprocess + SIGKILL**, not a mock
 exception. The single machine-checkable acceptance assertion:
@@ -404,7 +426,8 @@ no ambiguous window ever auto-replays a device action
    `UNIQUE(run_id, action_sequence)` alone does not. Failure case 10 is two
    different `action_id`s racing the same run.
 6. **Reconciliation never rewrites dispatch facts:** `dispatch_certainty` is
-   write-once; the ambiguous window stays `POSSIBLE` forever. A Pack
+   Core-updated only (not literal write-once); the ambiguous window stays
+   `POSSIBLE` forever and reconciliation never changes it. A Pack
    `reconciliation_verdict` is a separate field that may close `OUTCOME_UNKNOWN`
    to `FINALIZED` (ALREADY_APPLIED/NOT_APPLIED) or keep it open (UNKNOWN), but
    never produces `NOT_EXECUTED` and never changes `dispatch_certainty`.
@@ -414,3 +437,26 @@ no ambiguous window ever auto-replays a device action
    + tests. Record splits observation refs into `pre_execution_observation_refs`
    and `recovery_observation_refs`; `reconciliation_context` is a size-capped,
    non-sensitive JSON object supplied at `prepare()`.
+
+### Round 1d (source《mano开发设计评审_1019_1520》; Round-2 coding approved)
+
+`ecf9a71` cleared the two blockers + three prerequisites; Round-2 is approved
+with **no** further standalone doc round. Four items are closed in code **and**
+tests:
+
+8. **`dispatch_certainty` wording:** not literal write-once — Core updates it
+   only via legal execution-state transitions (incl. `POSSIBLE → NONE` on a
+   proven clean pre-ADB refusal); Pack reconciliation during recovery never
+   modifies it.
+9. **`FINALIZED` meaning:** "the journal is safely closed; no recovery needed."
+   The close path (normal execution vs ambiguous-window reconciliation) is
+   expressed by `dispatch_certainty` + `reconciliation_verdict` + `hook_applied`,
+   **not** a seventh state.
+10. **Stable `run_id`:** Consumer-supplied and reused across restarts; Core never
+    re-randomizes; missing/empty -> refuse to enable the journal (fail closed);
+    failure-matrix case 11 covers "new process resumes with the original
+    `run_id`."
+11. **Machine-checkable hook rule:** no hook -> default `NOT_APPLICABLE`; hook
+    present -> MUST declare `IDEMPOTENT` or `NOT_REPLAYABLE`; hook present but
+    `NOT_APPLICABLE` -> Pack config error, fail closed; `recovery_observation_refs`
+    are append-only.
