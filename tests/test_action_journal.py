@@ -567,6 +567,22 @@ def test_v1_index_without_unique_partial_is_corrupt(tmp_path: Path) -> None:
         SQLiteActionJournal(db)
 
 
+def test_v1_index_with_wrong_predicate_is_corrupt(tmp_path: Path) -> None:
+    db = str(tmp_path / "j.db")
+    SQLiteActionJournal(db).close()
+    raw = sqlite3.connect(db)
+    raw.execute("DROP INDEX idx_one_open_per_run")
+    # same name, UNIQUE, partial, on run_id — but the WHERE no longer covers the
+    # open states, so it silently drops the one-open-per-run invariant.
+    raw.execute(
+        "CREATE UNIQUE INDEX idx_one_open_per_run ON actions(run_id) "
+        "WHERE state='FINALIZED'"
+    )
+    raw.close()
+    with pytest.raises(JournalCorruptError):
+        SQLiteActionJournal(db)
+
+
 def test_schema_init_failure_leaves_no_half_built_db(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

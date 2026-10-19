@@ -22,6 +22,7 @@ Guarantees provided by this layer:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -484,6 +485,26 @@ class SQLiteActionJournal:
         if idx_cols != ["run_id"]:
             raise JournalCorruptError(
                 "idx_one_open_per_run must index exactly (run_id)"
+            )
+        # partial=1 alone is not enough: a same-named index with the wrong WHERE
+        # (e.g. state='FINALIZED') would silently drop the one-open-per-run
+        # invariant, so verify the predicate covers exactly the open states.
+        index_sql_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='index' AND name='idx_one_open_per_run'"
+        ).fetchone()
+        index_sql = index_sql_row[0] if index_sql_row else None
+        if not index_sql:
+            raise JournalCorruptError(
+                "idx_one_open_per_run definition unavailable"
+            )
+        where_match = re.search(r"\bwhere\b(.*)$", index_sql, re.IGNORECASE | re.DOTALL)
+        predicate = where_match.group(1) if where_match else ""
+        states_in_predicate = set(re.findall(r"'([^']*)'", predicate))
+        if "state" not in predicate.lower() or states_in_predicate != set(OPEN_STATES):
+            raise JournalCorruptError(
+                "idx_one_open_per_run predicate must cover exactly the open "
+                "states"
             )
 
     # -- transaction helper: any exception rolls back before propagating, so a
