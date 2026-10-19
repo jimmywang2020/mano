@@ -24,6 +24,13 @@ Status vocabulary: `PLANNED` -> `IMPLEMENTED` -> `UNIT_TESTED` ->
   - Original Sogou IME restored after every run.
   - Fail-closed preflight when the component is not installed.
   - No silent install / silent IME switch / silent downgrade.
+- **Run metadata (to fill from the human's records — never fabricated):**
+  - Acceptance date: `<待人类回填>`
+  - MuMu version / Android version: `<待人类回填>`
+  - OpenATX AdbKeyboard APK version or digest: `<待人类回填>`
+  - Run IDs / command transcript ref: `<待人类回填>`
+  - The source feedback《mano调用反馈_1016_1704》is **not** committed in this
+    repo; this tracked file is the in-repo summary of record.
 - **Scope note:** This certifies the Mano backend. APK install and backend
   selection remain Consumer/deployment concerns. The consumer default sampling
   backend stays `v01`; Mano runs behind a feature switch.
