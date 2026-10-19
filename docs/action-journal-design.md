@@ -12,7 +12,9 @@
 > never rewrites dispatch_certainty, hook NOT_APPLICABLE + ABI migration,
 > split pre/recovery observation refs), and《mano开发设计评审_1019_1520》
 > (dispatch_certainty not literal write-once, FINALIZED = safely-closed,
-> Consumer-supplied stable run_id, machine-checkable hook rule).
+> Consumer-supplied stable run_id, machine-checkable hook rule), and
+>《mano开发计划评审_1019_1541》(Consumer recovery-decision interface,
+> staged hook-ABI compatibility so `journal=None` keeps the old signature).
 
 ## 1. Problem statement
 
@@ -193,6 +195,44 @@ If the Pack has no `reconcile_action`, is schema-incompatible, or the Consumer
 returns no policy, the Runner MUST return a structured recovery result and keep
 **zero ADB** — it must not fall through into the normal loop.
 
+### Consumer recovery decision interface (Core reports facts, Consumer decides policy)
+
+Core must **never** read a Pack `ALREADY_APPLIED` / `NOT_APPLIED` verdict as a
+business "continue." The Runner takes an optional Consumer callback:
+
+```python
+recovery_decide: Callable[[RecoveryReport], RecoveryDecision] | None = None
+```
+
+`RecoveryReport` (Core-built, one per open action) carries **facts only**:
+
+```
+action_id
+core_fact              (§5 Core-fact enum)
+dispatch_certainty     NONE | POSSIBLE | CONFIRMED
+reconciliation_verdict ALREADY_APPLIED | NOT_APPLIED | UNKNOWN | None
+hook_applied           bool | None
+evidence_refs          pre_execution_observation_refs + recovery_observation_refs
+```
+
+`RecoveryDecision ∈ { CONTINUE, REPLAN, MANUAL_REVIEW, TERMINATE }`
+(继续 / 重新规划 / 人工审核 / 失败终止).
+
+Rules:
+
+- No open action -> normal run; `recovery_decide` is never called.
+- Open action found -> recovery observation + Pack `reconcile_action` first,
+  **then** `recovery_decide(report)`.
+- `recovery_decide is None` -> the Runner returns the structured
+  `RecoveryReport`(s), keeps **zero ADB**, and MUST NOT fall through into the
+  normal loop or self-interpret the verdict.
+- `CONTINUE` / `REPLAN` -> only now may Core close the record and proceed.
+- `MANUAL_REVIEW` / `TERMINATE` -> Core must **not** silently close or continue.
+- Two-phase alternative (no callback wired): Round-2 MAY also expose
+  `collect_recovery_reports(run_id) -> list[RecoveryReport]` that the Consumer
+  handles explicitly before re-invoking the Runner. Either way, Core never maps a
+  verdict to policy on its own.
+
 ## 6. New recovery interface — do NOT overload `verify`
 
 `verify` answers "does the approved target still hold *before* execution?" It
@@ -247,10 +287,22 @@ Core resolves `hook_recovery` with a **machine-checkable** rule (not mere docs):
 - `recovery_observation_refs` are **appended**, never overwriting earlier refs on
   repeated `UNKNOWN` reconciliation passes.
 - Core records `hook_applied` on `FINALIZED`.
-- **Round-2 hook ABI migration (not this round):** the hook today is
-  `on_action_executed(*, executed: ResolvedAction)`. Passing `action_id` +
-  `recovery: bool` requires updating `mano/pack.py` (Protocol), every existing
-  Pack, and their tests — not only the Runner. This is a Round-2 code task.
+- **Round-2 hook ABI migration + staged compatibility:** the hook today is
+  `on_action_executed(*, executed: ResolvedAction)`, and the external 采购助手
+  转转 Pack still implements exactly this old signature. To migrate without
+  breaking it:
+  - `journal=None` (today's default): the Runner keeps calling the **old** hook
+    signature unchanged — existing consumers are untouched.
+  - `journal` enabled: the new ABI (`action_id` + `recovery`) **and** a
+    `hook_recovery` declaration are required; incompatibility is validated and
+    **fails closed before the first device action**, never mid-run.
+  - Compatibility is resolved by **declaration**, not by catching `TypeError`
+    around the call (a genuine `TypeError` inside the hook body must not be
+    misread as a signature mismatch).
+  - This round migrates `mano/pack.py` (Protocol) + in-repo Packs + Mano tests;
+    the external 转转 Pack is migrated in a later step and, until its stable-
+    `action_id` de-dup + new-instance recovery are verified, declares
+    `NOT_REPLAYABLE` (not `IDEMPOTENT`).
 
 ## 7. Journal record — refs/hashes, not raw evidence
 
@@ -330,9 +382,11 @@ Requirements:
   Consumer MUST pass an explicit, stable `run_id`; crash recovery can find the
   prior open action **only** by reusing the **same** `run_id`. Core MUST NOT
   re-randomize a `run_id` per process start, and MUST **refuse to enable the
-  journal** (fail closed) when `run_id` is missing or empty. `mano.runner.run()`
-  gains a required `run_id` parameter in Round-2 (today it has none); a journal
-  without a stable `run_id` is disabled, not silently self-named.
+  journal** (fail closed, before any observation / model call / ADB) when
+  `run_id` is missing, empty, or whitespace-only. The Python signature stays
+  `run_id: str | None = None` (so `journal=None` callers are untouched); "required
+  run_id" is a **semantic** requirement that applies only when `journal` is set.
+  A journal without a stable `run_id` is disabled, not silently self-named.
 - `transition()` MUST atomically check `expected_state` **and**
   `expected_revision` before applying; mismatch raises (no silent overwrite).
 - SQLite reference impl: real transactions + `PRAGMA journal_mode=WAL`,
@@ -460,3 +514,33 @@ tests:
     present -> MUST declare `IDEMPOTENT` or `NOT_REPLAYABLE`; hook present but
     `NOT_APPLICABLE` -> Pack config error, fail closed; `recovery_observation_refs`
     are append-only.
+
+### Round 1e (source《mano开发计划评审_1019_1541》; Round-2 coding started)
+
+`1b62f95` cleared round-1d; Round-2 coding is authorized. Two interface items are
+added before wiring the Runner:
+
+12. **Consumer recovery-decision interface (§5):** an optional
+    `recovery_decide: Callable[[RecoveryReport], RecoveryDecision] | None`; with
+    no callback the Runner returns structured `RecoveryReport`(s) and keeps zero
+    ADB. Core never maps a Pack verdict to 继续/重新规划/人工审核/失败终止 itself.
+    A two-phase `collect_recovery_reports(run_id)` is an allowed alternative.
+13. **Staged hook-ABI compatibility (§6):** `journal=None` keeps the old
+    `on_action_executed(*, executed)` call so the external 采购助手/转转 Pack is
+    not broken; the new ABI + `hook_recovery` are enforced (fail-closed before
+    the first device action) **only** when `journal` is enabled. Compatibility is
+    by declaration, **not** by catching `TypeError`. The 转转 Pack declares
+    `NOT_REPLAYABLE` until its stable-`action_id` de-dup is verified.
+
+**Round-2 code split (HD-08 — isolate the regression surface):**
+
+- **Commit A (zero-change new path):** `mano/action_journal.py` (`ActionJournal`
+  Protocol + `SQLiteActionJournal` + `RecoveryReport` / `RecoveryDecision`) +
+  `tests/` failure matrix (fake ADB + real subprocess + SIGKILL). Touches no
+  existing runtime path; `journal` stays un-wired.
+- **Commit B (touches the live path):** wire `mano/runner.py` (`run_id` +
+  `journal` + `recovery_decide` + recovery entry) and migrate the
+  `on_action_executed` ABI in `mano/pack.py` + in-repo Packs + existing tests,
+  with `journal=None` proven byte-for-byte unchanged.
+- A controlled **real-device** crash-recovery acceptance is a later integration
+  gate (before flipping the production default), not part of Commit A/B.
