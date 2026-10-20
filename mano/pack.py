@@ -186,7 +186,9 @@ class Pack(Protocol):
     #     was PERSISTED with the action, not the current Pack's: an action
     #     journaled as NOT_APPLICABLE never runs a hook a later Pack added, and a
     #     persisted IDEMPOTENT hook replays only if the current Pack is still
-    #     IDEMPOTENT (otherwise PACK_INCOMPATIBLE, no replay).
+    #     IDEMPOTENT AND proves the SAME identity (non-empty ``pack_id`` +
+    #     ``reconciliation_schema_version`` equal on both sides); any mismatch or
+    #     missing identity -> PACK_INCOMPATIBLE, no replay, record stays EXECUTED.
 
     # reconcile_action(*, journaled_action, fresh_observation,
     #                  recovery: bool = True) -> ReconciliationResult is an
@@ -199,11 +201,12 @@ class Pack(Protocol):
     # -> the runner reports RECONCILIATION_UNAVAILABLE and never auto-replays. An
     # unstable recovery observation is NEVER reconciled (verdict forced UNKNOWN).
     #
-    # Compatibility attributes. A Pack that implements reconcile_action MUST
-    # advertise a stable identity (checked BEFORE any journaled action; missing ->
-    # journal_config_error):
+    # Compatibility attributes. A Pack that implements reconcile_action OR
+    # declares an IDEMPOTENT hook MUST advertise a stable identity (checked BEFORE
+    # any journaled action; missing -> journal_config_error):
     #   pack_id: str                        REQUIRED, non-empty stable identity
     #   reconciliation_schema_version: str  REQUIRED, non-empty
     #   pack_digest: str | None             audit-only; never alone forces incompat
     # On recovery BOTH persisted ``pack_id`` and schema must equal the current
-    # Pack's (a different pack_id with the same schema string -> PACK_INCOMPATIBLE).
+    # Pack's (a different pack_id with the same schema string -> PACK_INCOMPATIBLE);
+    # the SAME identity check gates both reconcile and IDEMPOTENT-hook replay.

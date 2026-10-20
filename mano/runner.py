@@ -369,6 +369,33 @@ def _reconcile_config_error(pack) -> Optional[str]:
     return None
 
 
+def _hook_identity_config_error(pack, hook_recovery) -> Optional[str]:
+    """An IDEMPOTENT hook is REPLAYED on recovery, so (like a reconcile-capable
+    Pack) it MUST advertise a stable identity: recovery proves the current Pack is
+    the one that journaled the action before replaying its hook."""
+    if hook_recovery != HOOK_IDEMPOTENT:
+        return None
+    if not _nonempty(getattr(pack, "pack_id", None)):
+        return "reconcile_pack_id_required"
+    if not _nonempty(getattr(pack, "reconciliation_schema_version", None)):
+        return "reconcile_schema_required"
+    return None
+
+
+def _identity_compatible(pack, rec) -> bool:
+    """The persisted and current Pack identity (``pack_id`` +
+    ``reconciliation_schema_version``) must BOTH be non-empty and equal. Shared by
+    reconcile and IDEMPOTENT-hook recovery so a different Pack reusing a schema
+    string can never close / replay another Pack's action."""
+    cur_pid = getattr(pack, "pack_id", None)
+    cur_sv = getattr(pack, "reconciliation_schema_version", None)
+    if not (_nonempty(cur_pid) and _nonempty(cur_sv)):
+        return False
+    if not (_nonempty(rec.pack_id) and _nonempty(rec.reconciliation_schema_version)):
+        return False
+    return cur_pid == rec.pack_id and cur_sv == rec.reconciliation_schema_version
+
+
 def _require_record(journal: ActionJournal, action_id: str):
     """Fetch a record through the Protocol, mapping a vanished row to a corrupt
     journal (a conforming Journal must never lose an in-flight action)."""
@@ -399,6 +426,10 @@ def _obs_ref(obs: Observation, work_dir: Path, run_dir: Path) -> dict:
         "screenshot": prefix + obs.screenshot,
         "xml": prefix + obs.xml_path,
         "foreground": obs.foreground,
+        "capture_started_at": obs.capture_started_at,
+        "capture_finished_at": obs.capture_finished_at,
+        "skew_ms": obs.skew_ms,
+        "stability": obs.stability,
     }
 
 
@@ -406,18 +437,10 @@ def _pack_reconcile_fact(pack, rec) -> str:
     """Core fact for an ambiguous (OUTCOME_UNKNOWN) record given the Pack's
     reconciliation capability: no interface -> RECONCILIATION_UNAVAILABLE; a
     missing / mismatched ``pack_id`` or ``reconciliation_schema_version`` (either
-    side) -> PACK_INCOMPATIBLE; otherwise AMBIGUOUS_EFFECT (judgeable). Matching on
-    both identity + schema stops a different Pack that happens to reuse a schema
-    string from silently closing another Pack's action."""
+    side) -> PACK_INCOMPATIBLE; otherwise AMBIGUOUS_EFFECT (judgeable)."""
     if not callable(getattr(pack, "reconcile_action", None)):
         return RECONCILIATION_UNAVAILABLE
-    cur_pid = getattr(pack, "pack_id", None)
-    cur_sv = getattr(pack, "reconciliation_schema_version", None)
-    if not (_nonempty(cur_pid) and _nonempty(cur_sv)):
-        return PACK_INCOMPATIBLE
-    if not (_nonempty(rec.pack_id) and _nonempty(rec.reconciliation_schema_version)):
-        return PACK_INCOMPATIBLE
-    if cur_pid != rec.pack_id or cur_sv != rec.reconciliation_schema_version:
+    if not _identity_compatible(pack, rec):
         return PACK_INCOMPATIBLE
     return AMBIGUOUS_EFFECT
 
@@ -505,10 +528,14 @@ def _run_recovery(
     if state == EXECUTED:
         # Recovery MUST honor the hook contract that was PERSISTED with the action,
         # never the current Pack's declaration: a Pack upgraded to add an IDEMPOTENT
-        # hook must not run it against an action journaled when it had no hook.
+        # hook must not run it against an action journaled when it had no hook. An
+        # IDEMPOTENT hook additionally requires the SAME Pack identity (pack_id +
+        # schema) before it may be replayed.
         persisted_hr = rec.hook_recovery
         current_hr, _cfg = _resolve_hook_recovery(pack)
-        incompatible = persisted_hr == HOOK_IDEMPOTENT and current_hr != HOOK_IDEMPOTENT
+        incompatible = persisted_hr == HOOK_IDEMPOTENT and (
+            current_hr != HOOK_IDEMPOTENT or not _identity_compatible(pack, rec)
+        )
         report, fresh = _emit(PACK_INCOMPATIBLE if incompatible else EXECUTION_CONFIRMED, None)
         if recovery_decide is None:
             return True, _RESULT_RECOVERY_REQUIRED
@@ -699,6 +726,10 @@ def run(
         hook_recovery, hook_cfg_err = _resolve_hook_recovery(pack)
         if hook_cfg_err is not None:
             journal_error_code = hook_cfg_err
+            return _result(_RESULT_JOURNAL_CONFIG_ERROR)
+        hook_id_err = _hook_identity_config_error(pack, hook_recovery)
+        if hook_id_err is not None:
+            journal_error_code = hook_id_err
             return _result(_RESULT_JOURNAL_CONFIG_ERROR)
         reconcile_cfg_err = _reconcile_config_error(pack)
         if reconcile_cfg_err is not None:

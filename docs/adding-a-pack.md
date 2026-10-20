@@ -393,9 +393,9 @@ auto-replayed after a crash.**
   recoverable, not replayable.
 - **Preflight (before any observation / model / ADB):** a non-empty `run_id` is
   required; a hook present must use the new ABI and declare `hook_recovery`; a
-  Pack with `reconcile_action` must advertise non-empty `pack_id` +
-  `reconciliation_schema_version`. Any failure returns `journal_config_error`
-  with zero device change.
+  Pack with `reconcile_action` **or** an `IDEMPOTENT` hook must advertise non-empty
+  `pack_id` + `reconciliation_schema_version`. Any failure returns
+  `journal_config_error` with zero device change.
 - **Exception classification at the execute seam:** text error with
   `action_may_have_executed=False → NOT_EXECUTED`; any ambiguous text error or
   other ADB failure → `OUTCOME_UNKNOWN`; ADB success but the `EXECUTED` write
@@ -410,8 +410,10 @@ auto-replayed after a crash.**
   - `EXECUTED` → ADB already happened, **never** replayed. Closed per the
     **persisted** `hook_recovery` (not the current Pack's): `NOT_APPLICABLE` closes
     straight to `FINALIZED`; `IDEMPOTENT` replays only the hook, and only if the
-    current Pack is still `IDEMPOTENT` (else `PACK_INCOMPATIBLE`, no replay);
-    `NOT_REPLAYABLE` is never replayed and is handed to the Consumer.
+    current Pack is still `IDEMPOTENT` **and proves the same identity** (non-empty
+    `pack_id` + `reconciliation_schema_version`, equal on both sides) — any
+    mismatch or missing identity → `PACK_INCOMPATIBLE`, no replay, record stays
+    `EXECUTED`; `NOT_REPLAYABLE` is never replayed and is handed to the Consumer.
   - `DISPATCHING`/`OUTCOME_UNKNOWN` → take one **fresh** recovery observation
     (append-only evidence refs), then ask `reconcile_action`. An **unstable**
     recovery observation is appended as evidence but never drives a verdict
@@ -420,10 +422,13 @@ auto-replayed after a crash.**
     `NOT_APPLIED` verdict from a compatible Pack; otherwise the run stops.
 - **Pack compatibility on recovery** compares BOTH the persisted and current
   `pack_id` and `reconciliation_schema_version` (a different `pack_id` reusing the
-  same schema string → `PACK_INCOMPATIBLE`); `pack_digest` is audit-only.
+  same schema string → `PACK_INCOMPATIBLE`); this single identity check gates both
+  `reconcile_action` and `IDEMPOTENT`-hook replay. `pack_digest` is audit-only.
 - **Evidence isolation:** journal mode writes each process's screenshots / XML /
   `steps.jsonl` under `run_dir/attempts/<uuid>/`, so a restart never overwrites
-  the crashed run's evidence.
+  the crashed run's evidence. Every observation ref (pre-execution and recovery)
+  carries capture timing (`capture_started_at` / `capture_finished_at` /
+  `skew_ms`) and `stability`; recovery refs are append-only.
 - **Pluggability:** the Core uses only the `ActionJournal` Protocol
   (`prepare` / `transition` / `load_open_actions` / `get_record`); a `get_record`
   returning `None` for an in-flight action is treated as `JOURNAL_CORRUPT`.

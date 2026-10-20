@@ -1011,6 +1011,113 @@ def test_restart_attempt_dir_does_not_overwrite_prior_evidence(tmp_path, monkeyp
 
 
 # --------------------------------------------------------------------------- #
+# H. Reviewer round 2: EXECUTED IDEMPOTENT-hook recovery also checks Pack identity
+#    (pack_id + schema), and observation refs carry capture timing.
+# --------------------------------------------------------------------------- #
+class IdempotentHookOnlyPack(FakePack):
+    """New-ABI IDEMPOTENT hook but NO reconcile_action; identity is advertised so
+    a valid instance passes preflight. Records every hook invocation."""
+
+    pack_id = _PACK_ID
+    reconciliation_schema_version = _SCHEMA
+    hook_recovery = HOOK_IDEMPOTENT
+
+    def __init__(self) -> None:
+        self.hook_replays: list[str] = []
+
+    def on_action_executed(self, *, executed, journaled_action, action_id, recovery):
+        self.hook_replays.append(action_id)
+
+
+def test_recovery_idempotent_hook_same_identity_replays_once_and_finalizes(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    _seed_open_action(db, "r1", to_state=EXECUTED, hook_recovery=HOOK_IDEMPOTENT,
+                      pack_id=_PACK_ID, schema=_SCHEMA)
+    pack = HookReconcilePack()
+    res = _recover(db, pack, tmp_path, decide=CONTINUE)
+    assert pack.hook_replays == ["r1:obs:1"]  # replayed exactly once
+    assert _only_record(db)["state"] == FINALIZED
+    assert _only_record(db)["hook_applied"] == 1
+    assert res.result == "terminate_success"
+
+
+def test_recovery_idempotent_hook_different_pack_id_is_incompatible(tmp_path, monkeypatch):
+    """The reviewer's blocking reproduction: wrong Pack, same schema, IDEMPOTENT."""
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    _seed_open_action(db, "r1", to_state=EXECUTED, hook_recovery=HOOK_IDEMPOTENT,
+                      pack_id="different-pack", schema=_SCHEMA)
+    pack = HookReconcilePack()  # pack_id=_PACK_ID, schema=_SCHEMA
+    res = _recover(db, pack, tmp_path, decide=CONTINUE)
+    assert res.result == "invalid_recovery_decision"
+    assert pack.hook_replays == []  # the wrong Pack's hook is NEVER replayed
+    assert _only_record(db)["state"] == EXECUTED  # stays open, not finalized
+    assert res.recovery_reports[0].core_fact == PACK_INCOMPATIBLE
+
+
+def test_recovery_idempotent_hook_different_schema_is_incompatible(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    _seed_open_action(db, "r1", to_state=EXECUTED, hook_recovery=HOOK_IDEMPOTENT,
+                      pack_id=_PACK_ID, schema="other-schema")
+    pack = HookReconcilePack()
+    res = _recover(db, pack, tmp_path, decide=CONTINUE)
+    assert res.result == "invalid_recovery_decision"
+    assert pack.hook_replays == []
+    assert _only_record(db)["state"] == EXECUTED
+    assert res.recovery_reports[0].core_fact == PACK_INCOMPATIBLE
+
+
+def test_recovery_idempotent_hook_missing_persisted_identity_is_incompatible(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    _seed_open_action(db, "r1", to_state=EXECUTED, hook_recovery=HOOK_IDEMPOTENT,
+                      pack_id=None, schema=_SCHEMA)  # persisted identity missing
+    pack = HookReconcilePack()
+    res = _recover(db, pack, tmp_path, decide=CONTINUE)
+    assert res.result == "invalid_recovery_decision"
+    assert pack.hook_replays == []
+    assert _only_record(db)["state"] == EXECUTED
+    assert res.recovery_reports[0].core_fact == PACK_INCOMPATIBLE
+
+
+def test_idempotent_hook_pack_missing_identity_fails_preflight(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+
+    class NoIdentity(IdempotentHookOnlyPack):
+        pack_id = ""  # IDEMPOTENT hook but no stable identity
+
+    j = SQLiteActionJournal(str(tmp_path / "j.db"))
+    adb = FakeAdb()
+    res = runner.run(adb, _click_then_terminate(), NoIdentity(), tmp_path, settle_s=0, journal=j, run_id="r1")
+    assert res.result == "journal_config_error"
+    assert res.journal_error_code == "reconcile_pack_id_required"
+    assert adb.tap_calls == 0  # blocked BEFORE any device action
+    j.close()
+
+
+def test_observation_refs_carry_capture_timing(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    # Normal execution writes a pre-execution ref; a seeded DISPATCHING then a
+    # recovery pass appends a recovery ref -> both must carry timing evidence.
+    j = SQLiteActionJournal(str(db))
+    runner.run(FakeAdb(), _click_then_terminate(), FakePack(), tmp_path, settle_s=0, journal=j, run_id="r1")
+    j.close()
+    pre = json.loads(_only_record(db)["pre_execution_observation_refs"])
+    assert pre and {"capture_started_at", "capture_finished_at", "skew_ms", "stability"} <= set(pre[0])
+
+    db2 = tmp_path / "j2.db"
+    _seed_open_action(db2, "r2", to_state=OUTCOME_UNKNOWN)
+    pack = SpyReconcilePack(verdict=ALREADY_APPLIED)
+    _recover(db2, pack, tmp_path, decide=None, run_id="r2")  # one recovery pass, append-only
+    refs = json.loads(_only_record(db2)["recovery_observation_refs"])
+    assert len(refs) == 1
+    assert {"capture_started_at", "capture_finished_at", "skew_ms", "stability"} <= set(refs[0])
+
+
+# --------------------------------------------------------------------------- #
 # Crash-child entrypoint: run ONE real Runner step and self-SIGKILL at <window>.
 # --------------------------------------------------------------------------- #
 class _CrashJournal:

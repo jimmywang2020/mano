@@ -62,3 +62,23 @@ git diff --check
    ```
 3. commit + push + `git rev-parse HEAD`。
 4. 回填 `HANDOFF_NEXT_SESSION.md` 的 commit：`<执行者 push 后回填>`。
+
+---
+
+## Round 2（基于 `2833eb9` 复核）— 1 阻塞 + 1 审计缺口
+
+Reviewer 复核 `2833eb9` 核销了上一轮 5 项，但发现 EXECUTED IDEMPOTENT hook 恢复
+**绕过 Pack 身份校验**（阻塞），以及 `_obs_ref()` 证据缺时间戳（审计）。均属原冻结
+“逐动作耐久 journal / 恢复兼容性 / 证据契约”范围内，未扩范围。
+
+| 规范 | 实现 | 测试（均 reviewer 必需） |
+|---|---|---|
+| EXECUTED 的 IDEMPOTENT hook 回放前须证**同一 Pack 身份**（pack_id+schema 两侧非空且相等），否则 PACK_INCOMPATIBLE、不调 hook、不转 FINALIZED、保持 EXECUTED、拒 CONTINUE/REPLAN | `runner._identity_compatible`（reconcile 与 hook 共用）；EXECUTED 分支 `incompatible = persisted==IDEMPOTENT and (current!=IDEMPOTENT or not _identity_compatible)` | 正: `test_recovery_idempotent_hook_same_identity_replays_once_and_finalizes`；反: `..._different_pack_id_...`（reviewer 复现场景）、`..._different_schema_...`、`..._missing_persisted_identity_...` |
+| IDEMPOTENT hook 的 Pack 也必须在 preflight 声明非空身份 | `runner._hook_identity_config_error` 接入 run() preflight | `test_idempotent_hook_pack_missing_identity_fails_preflight`（零 ADB） |
+| observation refs 带捕获时间/`skew_ms`/`stability`，不复制原始证据；追加语义不变 | `runner._obs_ref` 增补 `capture_started_at`/`capture_finished_at`/`skew_ms`/`stability` | `test_observation_refs_carry_capture_timing`（pre-execution + recovery 两侧均含时间字段） |
+
+文档：`mano/pack.py`、`docs/adding-a-pack.md` 同步“IDEMPOTENT 回放须同身份”“refs 带时间”。
+`docs/action-journal-design.md` 仍冻结未改。
+
+验收标准（reviewer 指定）：既有 198 全绿 + 新组合测试全绿；错误 Pack 复现
+`core_fact=PACK_INCOMPATIBLE / hook_replays=0 / state=EXECUTED`；`git diff --check` 无输出。
