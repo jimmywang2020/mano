@@ -69,6 +69,29 @@ class ResolveDecision:
     resolved_action: dict
     reason: str = ""
     metadata: dict = field(default_factory=dict)
+    # Optional, journal-only: a minimal, non-sensitive, JSON-serializable dict the
+    # Pack needs to recognize this action's effect after a crash (e.g. the stable
+    # target id + matched rule). It is persisted at prepare() time and handed back
+    # to reconcile_action on a fresh Pack instance; never screenshots / XML / keys
+    # / large evidence. The Core never interprets it; the journal enforces the JSON
+    # type + size cap. Ignored when journal is disabled.
+    reconciliation_context: dict | None = None
+
+
+@dataclass
+class ReconciliationResult:
+    """Result of ``Pack.reconcile_action`` (crash recovery only): is the action's
+    effect present *now*, judged from a fresh post-restart observation?
+
+    ``verdict`` is a *semantic* fact, separate from the journal's dispatch
+    certainty: ``ALREADY_APPLIED`` = effect present now, ``NOT_APPLIED`` = effect
+    absent now, ``UNKNOWN`` = cannot tell. Neither ALREADY/NOT proves whether the
+    ADB command dispatched; the Core never reads a verdict as a business decision.
+    """
+
+    verdict: str  # ALREADY_APPLIED | NOT_APPLIED | UNKNOWN
+    reason: str = ""
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -129,14 +152,49 @@ class Pack(Protocol):
     # fallback (foreground/raw-XML change -> REOBSERVE; otherwise execute the
     # initial resolved action). Real packs must implement verify.
 
-    # on_action_executed(*, executed: ResolvedAction) -> None is an OPTIONAL
-    # post-execute notification. The runner calls it once per *successfully
-    # executed device action*, after ADB confirms the change and before the next
-    # observation; never on wait/terminate, BLOCK/REOBSERVE, approve veto,
-    # foreground change, verify rejection, anti-swap, or ADB failure. ``executed``
-    # carries the semantic target, the final action handed to ADB (post-verify
-    # coordinates), and the final-stage metadata (verify's when verify ran -- even
-    # {} -- else resolve's), passed as deep copies; the Core never reads it. A
-    # pack that raises here stops the run (``post_execute_hook_failed``); the
-    # action already happened and is never replayed. Exactly-once holds only
-    # within one process's normal control flow, not across a crash.
+    # on_action_executed is an OPTIONAL post-execute notification with TWO ABIs,
+    # selected by whether the journal is wired (NOT by catching TypeError):
+    #
+    #   journal DISABLED (default) -- legacy ABI, unchanged for existing packs:
+    #       on_action_executed(*, executed: ResolvedAction) -> None
+    #     Called once per *successfully executed device action*, after ADB confirms
+    #     the change and before the next observation; never on wait/terminate,
+    #     BLOCK/REOBSERVE, approve veto, foreground change, verify rejection,
+    #     anti-swap, or ADB failure. ``executed`` carries the semantic target, the
+    #     final action handed to ADB (post-verify coordinates), and the final-stage
+    #     metadata (verify's when verify ran -- even {} -- else resolve's), as deep
+    #     copies. A pack that raises stops the run (``post_execute_hook_failed``);
+    #     the action already happened and is never replayed. Exactly-once holds
+    #     only within one process's normal control flow, not across a crash.
+    #
+    #   journal ENABLED -- new ABI (required, declared, checked before the first
+    #   device action):
+    #       on_action_executed(*, executed: ResolvedAction | None,
+    #                          journaled_action, action_id: str,
+    #                          recovery: bool) -> None
+    #     Normal execution: ``executed`` is the action, ``recovery=False``. Crash
+    #     recovery (IDEMPOTENT only): ``executed=None``, ``recovery=True``; the
+    #     Pack restores from ``journaled_action`` + its ``reconciliation_context``.
+    #     A pack that supplies this hook MUST also declare
+    #       hook_recovery = "IDEMPOTENT" | "NOT_REPLAYABLE"
+    #     (``IDEMPOTENT`` allows replaying the hook ONLY on recovery, never the
+    #     ADB action; ``NOT_REPLAYABLE`` is never replayed and is handed to the
+    #     Consumer). A hook present but left/declared NOT_APPLICABLE, or using the
+    #     legacy signature, is a Pack config error -> the runner refuses to enable
+    #     the journal (fail closed). No hook -> NOT_APPLICABLE (EXECUTED closes
+    #     straight to FINALIZED, no replay).
+
+    # reconcile_action(*, journaled_action, fresh_observation,
+    #                  recovery: bool = True) -> ReconciliationResult is an
+    # OPTIONAL crash-recovery capability, distinct from verify(): verify answers
+    # "does the approved target still hold BEFORE execution?"; reconcile_action
+    # answers "after a crash, is this action's effect present now?". It is called
+    # only during recovery, against a FRESH post-restart observation, with the
+    # stable ``action_id`` (inside ``journaled_action``) and ``recovery=True``, and
+    # MUST work from a NEW Pack instance (no in-process caches). A pack without it
+    # -> the runner reports RECONCILIATION_UNAVAILABLE and never auto-replays.
+    #
+    # Optional compatibility attributes (used by journal recovery):
+    #   pack_id: str                        stable pack identity (audit + compat)
+    #   pack_digest: str | None             audit-only; never alone forces incompat
+    #   reconciliation_schema_version: str  mismatch -> PACK_INCOMPATIBLE

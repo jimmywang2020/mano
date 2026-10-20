@@ -389,6 +389,12 @@ class SQLiteActionJournal:
     creates a hidden default database."""
 
     def __init__(self, path: str, *, busy_timeout_ms: int = 5000) -> None:
+        # Durability is the whole point: a crash must leave a replayable record on
+        # disk, so an empty path or an in-memory database is rejected outright
+        # (":memory:" / "" vanish on process exit and would silently defeat
+        # recovery).
+        if not isinstance(path, str) or not path.strip() or path.strip() == ":memory:":
+            raise ActionJournalError("ActionJournal requires a durable on-disk path")
         self._conn = sqlite3.connect(path, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
