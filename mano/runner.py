@@ -5,10 +5,11 @@ reuses the existing mano modules (Adb / GuiVLM / execute_action / action_codec /
 media) and keeps only the generic parts: device health, evidence journaling,
 single-step VLM assembly with retry, and the runtime anti-loop guards.
 
-Scope note (0.x): the guards below are *runtime anti-loop* only. Crash recovery
-and blurry-window non-replay are NOT implemented here. Cost/price estimation is
-NOT computed here either; the runner records raw usage and leaves pricing to the
-caller.
+Scope note (0.x): the runtime anti-loop guards below are generic. When a durable
+``journal`` is supplied the loop also brackets every device-modifying action and
+replays nothing from the blurry window on restart; with ``journal=None`` neither
+is active. Cost/price estimation is NOT computed here; the runner records raw
+usage and leaves pricing to the caller.
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ from .action_journal import (
     ActionIntent,
     ActionJournal,
     ActionJournalError,
+    JournalCorruptError,
     RecoveryReport,
     core_fact_from_state,
 )
@@ -349,6 +351,34 @@ def _resolve_hook_recovery(pack) -> tuple[Optional[str], Optional[str]]:
     return declared, None
 
 
+def _nonempty(value) -> bool:
+    """A non-empty string identity (``None`` / blank are both rejected)."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _reconcile_config_error(pack) -> Optional[str]:
+    """A Pack that can reconcile MUST advertise a stable identity: non-empty
+    ``pack_id`` + ``reconciliation_schema_version``, so a later process can prove
+    the recovering Pack is the same one that journaled the action."""
+    if not callable(getattr(pack, "reconcile_action", None)):
+        return None
+    if not _nonempty(getattr(pack, "pack_id", None)):
+        return "reconcile_pack_id_required"
+    if not _nonempty(getattr(pack, "reconciliation_schema_version", None)):
+        return "reconcile_schema_required"
+    return None
+
+
+def _require_record(journal: ActionJournal, action_id: str):
+    """Fetch a record through the Protocol, mapping a vanished row to a corrupt
+    journal (a conforming Journal must never lose an in-flight action)."""
+    rec = journal.get_record(action_id)
+    if rec is None:
+        raise JournalCorruptError(f"journal lost record {action_id!r}")
+    return rec
+
+
+
 def _payload_hash(action: dict) -> str:
     """Stable hash of the non-coordinate execution payload (reuses action_codec's
     canonical ``execution_payload``; no third normalization path)."""
@@ -375,10 +405,19 @@ def _obs_ref(obs: Observation, work_dir: Path, run_dir: Path) -> dict:
 def _pack_reconcile_fact(pack, rec) -> str:
     """Core fact for an ambiguous (OUTCOME_UNKNOWN) record given the Pack's
     reconciliation capability: no interface -> RECONCILIATION_UNAVAILABLE; a
-    schema mismatch -> PACK_INCOMPATIBLE; otherwise AMBIGUOUS_EFFECT (judgeable)."""
+    missing / mismatched ``pack_id`` or ``reconciliation_schema_version`` (either
+    side) -> PACK_INCOMPATIBLE; otherwise AMBIGUOUS_EFFECT (judgeable). Matching on
+    both identity + schema stops a different Pack that happens to reuse a schema
+    string from silently closing another Pack's action."""
     if not callable(getattr(pack, "reconcile_action", None)):
         return RECONCILIATION_UNAVAILABLE
-    if getattr(pack, "reconciliation_schema_version", None) != rec.reconciliation_schema_version:
+    cur_pid = getattr(pack, "pack_id", None)
+    cur_sv = getattr(pack, "reconciliation_schema_version", None)
+    if not (_nonempty(cur_pid) and _nonempty(cur_sv)):
+        return PACK_INCOMPATIBLE
+    if not (_nonempty(rec.pack_id) and _nonempty(rec.reconciliation_schema_version)):
+        return PACK_INCOMPATIBLE
+    if cur_pid != rec.pack_id or cur_sv != rec.reconciliation_schema_version:
         return PACK_INCOMPATIBLE
     return AMBIGUOUS_EFFECT
 
@@ -418,7 +457,7 @@ def _run_recovery(
     state = rec.state
 
     def _emit(core_fact: str, verdict: Optional[str]):
-        fresh = journal.get_record(action_id)
+        fresh = _require_record(journal, action_id)
         report = RecoveryReport(
             run_id=fresh.run_id,
             action_sequence=fresh.action_sequence,
@@ -464,7 +503,13 @@ def _run_recovery(
         return False, None
 
     if state == EXECUTED:
-        report, fresh = _emit(EXECUTION_CONFIRMED, None)
+        # Recovery MUST honor the hook contract that was PERSISTED with the action,
+        # never the current Pack's declaration: a Pack upgraded to add an IDEMPOTENT
+        # hook must not run it against an action journaled when it had no hook.
+        persisted_hr = rec.hook_recovery
+        current_hr, _cfg = _resolve_hook_recovery(pack)
+        incompatible = persisted_hr == HOOK_IDEMPOTENT and current_hr != HOOK_IDEMPOTENT
+        report, fresh = _emit(PACK_INCOMPATIBLE if incompatible else EXECUTION_CONFIRMED, None)
         if recovery_decide is None:
             return True, _RESULT_RECOVERY_REQUIRED
         decision = _safe_recovery_decision(recovery_decide, report)
@@ -474,8 +519,11 @@ def _run_recovery(
             return True, _RESULT_RECOVERY_TERMINATED
         if decision not in (CONTINUE, REPLAN):
             return True, _RESULT_INVALID_RECOVERY_DECISION
-        # ADB already confirmed: NEVER replay it. Close per the hook declaration.
-        if hook_recovery == HOOK_NOT_APPLICABLE:
+        # ADB already confirmed: NEVER replay it. Close per the PERSISTED hook
+        # declaration; an unsatisfiable hook contract can never be auto-continued.
+        if incompatible:
+            return True, _RESULT_INVALID_RECOVERY_DECISION
+        if persisted_hr == HOOK_NOT_APPLICABLE:
             journal.transition(
                 action_id,
                 expected_state=EXECUTED,
@@ -484,7 +532,7 @@ def _run_recovery(
                 patch={"hook_applied": False},
             )
             return False, None
-        if hook_recovery == HOOK_IDEMPOTENT:
+        if persisted_hr == HOOK_IDEMPOTENT:
             hook = getattr(pack, "on_action_executed", None)
             try:
                 hook(executed=None, journaled_action=fresh, action_id=action_id, recovery=True)
@@ -529,10 +577,17 @@ def _run_recovery(
             new_state=OUTCOME_UNKNOWN,
             patch={"recovery_observation_refs": [ref]},
         )
-    fresh = journal.get_record(action_id)
+    fresh = _require_record(journal, action_id)
+    stable = obs.stability == "stable"
+    log({"recovery": True, "action_id": action_id, "recovery_stability": obs.stability})
     core_fact = _pack_reconcile_fact(pack, fresh)
     verdict: Optional[str] = None
-    if core_fact == AMBIGUOUS_EFFECT:
+    if core_fact == AMBIGUOUS_EFFECT and not stable:
+        # An unstable recovery observation (foreground switch / capture timeout) is
+        # appended as failure evidence but MUST NOT drive a verdict: treat as
+        # UNKNOWN so CONTINUE/REPLAN is refused and OUTCOME_UNKNOWN stays open.
+        verdict = UNKNOWN
+    elif core_fact == AMBIGUOUS_EFFECT:
         reconcile = getattr(pack, "reconcile_action", None)
         try:
             rr = reconcile(journaled_action=fresh, fresh_observation=obs, recovery=True)
@@ -644,6 +699,10 @@ def run(
         hook_recovery, hook_cfg_err = _resolve_hook_recovery(pack)
         if hook_cfg_err is not None:
             journal_error_code = hook_cfg_err
+            return _result(_RESULT_JOURNAL_CONFIG_ERROR)
+        reconcile_cfg_err = _reconcile_config_error(pack)
+        if reconcile_cfg_err is not None:
+            journal_error_code = reconcile_cfg_err
             return _result(_RESULT_JOURNAL_CONFIG_ERROR)
 
     ensure_adb_ready(adb)
@@ -1072,10 +1131,6 @@ def run(
                 # ame=False is the only proof of no dispatch -> NOT_EXECUTED; any
                 # ambiguous text error -> OUTCOME_UNKNOWN (never replayed).
                 new_state = OUTCOME_UNKNOWN if exc.action_may_have_executed else NOT_EXECUTED
-                try:
-                    journal.transition(action_id, expected_state=DISPATCHING, expected_revision=dispatch_rev, new_state=new_state)
-                except ActionJournalError:
-                    pass
                 _record_text_error(
                     record,
                     exc.code,
@@ -1084,16 +1139,30 @@ def run(
                     state_changed=exc.device_state_may_have_changed,
                 )
                 record["exec_error"] = str(exc)[:500]
+                try:
+                    journal.transition(action_id, expected_state=DISPATCHING, expected_revision=dispatch_rev, new_state=new_state)
+                except ActionJournalError as jexc:
+                    # The classification could not be persisted -> surface the journal
+                    # failure explicitly (never swallow it); the record stays open.
+                    journal_error_code = jexc.code
+                    record["journal_error"] = jexc.code
+                    log(record)
+                    jsonl.close()
+                    return _result(_RESULT_JOURNAL_ERROR, total_steps=step, actions_executed=actions_executed, reobserves=reobserves)
                 log(record)
                 result = "text_ambiguous_execution" if exc.action_may_have_executed else "exec_refused"
                 break
             except (ManoError, subprocess.CalledProcessError, OSError) as exc:
                 # Cannot prove the dispatch did not happen -> OUTCOME_UNKNOWN.
+                record["exec_error"] = str(exc)[:500]
                 try:
                     journal.transition(action_id, expected_state=DISPATCHING, expected_revision=dispatch_rev, new_state=OUTCOME_UNKNOWN)
-                except ActionJournalError:
-                    pass
-                record["exec_error"] = str(exc)[:500]
+                except ActionJournalError as jexc:
+                    journal_error_code = jexc.code
+                    record["journal_error"] = jexc.code
+                    log(record)
+                    jsonl.close()
+                    return _result(_RESULT_JOURNAL_ERROR, total_steps=step, actions_executed=actions_executed, reobserves=reobserves)
                 log(record)
                 result = "exec_refused"
                 break
@@ -1122,13 +1191,23 @@ def run(
             else:
                 hook = getattr(pack, "on_action_executed", None)
                 try:
+                    journaled = _require_record(journal, action_id)
+                except ActionJournalError as exc:
+                    # A journal read failure before the hook is a journal error, not
+                    # a hook failure; the action stays EXECUTED and is never replayed.
+                    journal_error_code = exc.code
+                    record["journal_error"] = exc.code
+                    log(record)
+                    jsonl.close()
+                    return _result(_RESULT_JOURNAL_ERROR, total_steps=step, actions_executed=actions_executed, reobserves=reobserves)
+                try:
                     hook(
                         executed=ResolvedAction(
                             semantic_target=decision.semantic_target,
                             resolved_action=deepcopy(final),
                             metadata=deepcopy(final_metadata),
                         ),
-                        journaled_action=journal.get_record(action_id),
+                        journaled_action=journaled,
                         action_id=action_id,
                         recovery=False,
                     )

@@ -209,9 +209,10 @@ Key points when integrating:
   run stops with `post_execute_hook_failed` (recorded as `post_execute_error`, not
   `exec_error`) and the action is **never replayed**. Exactly-once holds only
   within one process's normal control flow — it is **not** promised across a
-  crash (ADB may succeed then the process die before the hook); durable
-  journaling is a Non-goal below. Core passes only the execution facts and never
-  interprets the metadata.
+  crash (ADB may succeed then the process die before the hook) in the default
+  (`journal=None`) mode. With a durable `journal=` wired, the new hook ABI plus
+  crash recovery close that gap; see "Durable action journal + crash recovery"
+  below. Core passes only the execution facts and never interprets the metadata.
 
 ### Text input is backend-dependent
 
@@ -371,10 +372,60 @@ RIGHT:
 
 ### Non-goals (0.x)
 
-Not implemented in the Core yet, and not claimed by shipping this loop: crash
-recovery / durable journaling, lease/fencing for concurrent runners, XML
-normalization or a stability fingerprint, visual↔XML consistency checking, and
-any app logic (Duolingo/转转 semantics live only in their Packs, never in the
-Core).
+Not implemented in the Core yet, and not claimed by shipping this loop:
+lease/fencing for concurrent runners (beyond the journal's at-most-one-open-action
+rule), XML normalization or a stability fingerprint, visual↔XML consistency
+checking, and any app logic (Duolingo/转转 semantics live only in their Packs,
+never in the Core). Durable journaling + crash recovery ARE now available as an
+opt-in (`journal=`); see the next section.
+
+### Durable action journal + crash recovery (optional)
+
+`run(..., journal=ActionJournal, run_id="stable-id", recovery_decide=cb)` wires a
+durable, per-action SQLite journal (`mano/action_journal.py`). With `journal=None`
+(default) none of this is active and the legacy hook ABI is unchanged. The single
+invariant: **a device action that sits in the blurry execution window is never
+auto-replayed after a crash.**
+
+- **Fixed execution order (every device-modifying action):** `prepare → PREPARED
+  → DISPATCHING → execute → EXECUTED → hook → FINALIZED`. `PREPARED` and
+  `DISPATCHING` are durable *before* ADB is touched, so a crash mid-dispatch is
+  recoverable, not replayable.
+- **Preflight (before any observation / model / ADB):** a non-empty `run_id` is
+  required; a hook present must use the new ABI and declare `hook_recovery`; a
+  Pack with `reconcile_action` must advertise non-empty `pack_id` +
+  `reconciliation_schema_version`. Any failure returns `journal_config_error`
+  with zero device change.
+- **Exception classification at the execute seam:** text error with
+  `action_may_have_executed=False → NOT_EXECUTED`; any ambiguous text error or
+  other ADB failure → `OUTCOME_UNKNOWN`; ADB success but the `EXECUTED` write
+  fails → the record stays `DISPATCHING`, the run stops, no hook. **Any** journal
+  CAS conflict / DB-busy / corruption (including a failed state write after an ADB
+  error) stops the run with `journal_error`; the Core never silently degrades to
+  running without the journal, and never swallows a journal write failure.
+- **Recovery runs before the normal loop** for every open action of that
+  `run_id`, and only reads the device:
+  - `PREPARED` → ADB never entered → close `NOT_EXECUTED` (the stale intent is
+    discarded; old coordinates are never replayed).
+  - `EXECUTED` → ADB already happened, **never** replayed. Closed per the
+    **persisted** `hook_recovery` (not the current Pack's): `NOT_APPLICABLE` closes
+    straight to `FINALIZED`; `IDEMPOTENT` replays only the hook, and only if the
+    current Pack is still `IDEMPOTENT` (else `PACK_INCOMPATIBLE`, no replay);
+    `NOT_REPLAYABLE` is never replayed and is handed to the Consumer.
+  - `DISPATCHING`/`OUTCOME_UNKNOWN` → take one **fresh** recovery observation
+    (append-only evidence refs), then ask `reconcile_action`. An **unstable**
+    recovery observation is appended as evidence but never drives a verdict
+    (forced `UNKNOWN`); `reconcile_action` is not called and the action is not
+    closed. `CONTINUE`/`REPLAN` is legal only with a concrete `ALREADY_APPLIED` /
+    `NOT_APPLIED` verdict from a compatible Pack; otherwise the run stops.
+- **Pack compatibility on recovery** compares BOTH the persisted and current
+  `pack_id` and `reconciliation_schema_version` (a different `pack_id` reusing the
+  same schema string → `PACK_INCOMPATIBLE`); `pack_digest` is audit-only.
+- **Evidence isolation:** journal mode writes each process's screenshots / XML /
+  `steps.jsonl` under `run_dir/attempts/<uuid>/`, so a restart never overwrites
+  the crashed run's evidence.
+- **Pluggability:** the Core uses only the `ActionJournal` Protocol
+  (`prepare` / `transition` / `load_open_actions` / `get_record`); a `get_record`
+  returning `None` for an in-flight action is treated as `JOURNAL_CORRUPT`.
 
 

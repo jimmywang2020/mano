@@ -182,7 +182,11 @@ class Pack(Protocol):
     #     Consumer). A hook present but left/declared NOT_APPLICABLE, or using the
     #     legacy signature, is a Pack config error -> the runner refuses to enable
     #     the journal (fail closed). No hook -> NOT_APPLICABLE (EXECUTED closes
-    #     straight to FINALIZED, no replay).
+    #     straight to FINALIZED, no replay). Recovery honors the declaration that
+    #     was PERSISTED with the action, not the current Pack's: an action
+    #     journaled as NOT_APPLICABLE never runs a hook a later Pack added, and a
+    #     persisted IDEMPOTENT hook replays only if the current Pack is still
+    #     IDEMPOTENT (otherwise PACK_INCOMPATIBLE, no replay).
 
     # reconcile_action(*, journaled_action, fresh_observation,
     #                  recovery: bool = True) -> ReconciliationResult is an
@@ -192,9 +196,14 @@ class Pack(Protocol):
     # only during recovery, against a FRESH post-restart observation, with the
     # stable ``action_id`` (inside ``journaled_action``) and ``recovery=True``, and
     # MUST work from a NEW Pack instance (no in-process caches). A pack without it
-    # -> the runner reports RECONCILIATION_UNAVAILABLE and never auto-replays.
+    # -> the runner reports RECONCILIATION_UNAVAILABLE and never auto-replays. An
+    # unstable recovery observation is NEVER reconciled (verdict forced UNKNOWN).
     #
-    # Optional compatibility attributes (used by journal recovery):
-    #   pack_id: str                        stable pack identity (audit + compat)
+    # Compatibility attributes. A Pack that implements reconcile_action MUST
+    # advertise a stable identity (checked BEFORE any journaled action; missing ->
+    # journal_config_error):
+    #   pack_id: str                        REQUIRED, non-empty stable identity
+    #   reconciliation_schema_version: str  REQUIRED, non-empty
     #   pack_digest: str | None             audit-only; never alone forces incompat
-    #   reconciliation_schema_version: str  mismatch -> PACK_INCOMPATIBLE
+    # On recovery BOTH persisted ``pack_id`` and schema must equal the current
+    # Pack's (a different pack_id with the same schema string -> PACK_INCOMPATIBLE).

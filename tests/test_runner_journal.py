@@ -41,9 +41,11 @@ from mano import runner  # noqa: E402
 # --- real imports -------------------------------------------------------------
 from mano.action_journal import (  # noqa: E402
     ALREADY_APPLIED,
+    AMBIGUOUS_EFFECT,
     CONTINUE,
     DISPATCHING,
     EXECUTED,
+    EXECUTION_CONFIRMED,
     FINALIZED,
     HOOK_IDEMPOTENT,
     HOOK_NOT_APPLICABLE,
@@ -52,16 +54,22 @@ from mano.action_journal import (  # noqa: E402
     NOT_APPLIED,
     NOT_EXECUTED,
     OUTCOME_UNKNOWN,
+    PACK_INCOMPATIBLE,
     PREPARED,
+    RECONCILIATION_UNAVAILABLE,
+    REPLAN,
     TERMINATE,
+    UNKNOWN,
     ActionIntent,
     ActionJournalError,
     ActiveActionError,
+    JournalCorruptError,
     SQLiteActionJournal,
 )
 from mano.pack import ALLOW, ReconciliationResult, ResolveDecision  # noqa: E402
 
 _SCHEMA = "recon-v1"
+_PACK_ID = "reconcile-pack"
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +182,7 @@ class ReconcilePack(FakePack):
     file). ``>0`` dispatches observed -> ALREADY_APPLIED, else NOT_APPLIED. No
     hook -> HOOK_NOT_APPLICABLE in journal mode."""
 
+    pack_id = _PACK_ID
     reconciliation_schema_version = _SCHEMA
 
     def __init__(self, *, counter_path: Path | None = None) -> None:
@@ -394,7 +403,10 @@ def test_generic_adb_failure_marks_outcome_unknown(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # D. Recovery decisions on a pre-existing open action (no model, no ADB replay).
 # --------------------------------------------------------------------------- #
-def _seed_open_action(db_path: Path, run_id: str, *, to_state: str, hook_recovery=HOOK_NOT_APPLICABLE) -> str:
+def _seed_open_action(
+    db_path: Path, run_id: str, *, to_state: str, hook_recovery=HOOK_NOT_APPLICABLE,
+    pack_id: str | None = _PACK_ID, schema: str | None = _SCHEMA,
+) -> str:
     """Drive a real journal into an open ``to_state`` as the runner would."""
     j = SQLiteActionJournal(str(db_path))
     action_id = f"{run_id}:obs:1"
@@ -404,7 +416,8 @@ def _seed_open_action(db_path: Path, run_id: str, *, to_state: str, hook_recover
         semantic_target="t",
         action_type="click",
         execution_payload_hash="h",
-        reconciliation_schema_version=_SCHEMA,
+        pack_id=pack_id,
+        reconciliation_schema_version=schema,
         hook_recovery=hook_recovery,
     )
     prepared = j.prepare(intent)
@@ -614,6 +627,387 @@ class _CountingAdb(FakeAdb):
     def tap(self, x: int, y: int) -> None:
         _bump_counter(self._counter_path)
         super().tap(x, y)
+
+
+# --------------------------------------------------------------------------- #
+# G. Reviewer-requested hardening (the 5 protocol-defect fixes).
+#    Shared fakes for this section.
+# --------------------------------------------------------------------------- #
+class NotReplayableReconcilePack(ReconcilePack):
+    """New-ABI hook declared NOT_REPLAYABLE: a hook is present but must never be
+    replayed on recovery, regardless of the current/persisted matrix."""
+
+    hook_recovery = HOOK_NOT_REPLAYABLE
+
+    def __init__(self, *, counter_path: Path | None = None) -> None:
+        super().__init__(counter_path=counter_path)
+        self.hook_replays: list[str] = []
+
+    def on_action_executed(self, *, executed, journaled_action, action_id, recovery):
+        self.hook_replays.append(action_id)
+
+
+class SpyReconcilePack(ReconcilePack):
+    """Records whether ``reconcile_action`` was actually invoked, and lets a test
+    pin the returned verdict."""
+
+    def __init__(self, *, verdict: str = ALREADY_APPLIED, counter_path: Path | None = None) -> None:
+        super().__init__(counter_path=counter_path)
+        self._verdict = verdict
+        self.reconcile_calls = 0
+
+    def reconcile_action(self, *, journaled_action, fresh_observation, recovery=True) -> ReconciliationResult:
+        self.reconcile_calls += 1
+        return ReconciliationResult(verdict=self._verdict, reason="spy")
+
+
+class RaisingHookPack(HookReconcilePack):
+    """Idempotent hook that raises on NORMAL execution (recovery=False)."""
+
+    def on_action_executed(self, *, executed, journaled_action, action_id, recovery):
+        if not recovery:
+            raise RuntimeError("hook boom")
+        self.hook_replays.append(action_id)
+
+
+class UnstableAdb(FakeAdb):
+    """Foreground flips across the capture window -> observation never stable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fg = 0
+
+    def foreground_package(self) -> str:
+        self._fg += 1
+        return "com.a" if self._fg % 2 else "com.b"
+
+
+class ProtocolOnlyJournal:
+    """Exposes ONLY the four methods the runner is allowed to use. Any other
+    attribute access would raise, proving the runner is Protocol-pure."""
+
+    _ALLOWED = {"prepare", "transition", "load_open_actions", "get_record", "close"}
+
+    def __init__(self, real: SQLiteActionJournal) -> None:
+        object.__setattr__(self, "_real", real)
+
+    def __getattr__(self, name):
+        if name in ProtocolOnlyJournal._ALLOWED:
+            return getattr(object.__getattribute__(self, "_real"), name)
+        raise AttributeError(f"runner touched non-Protocol journal method: {name}")
+
+
+class FaultJournal:
+    """Wraps a real journal and raises ``ActionJournalError`` on exactly ONE
+    (from_state -> to_state) transition, to prove the runner never swallows a
+    journal write failure."""
+
+    def __init__(self, real: SQLiteActionJournal, *, fail_transition, error=None) -> None:
+        self._real = real
+        self._from, self._to = fail_transition
+        self._error = error or ActionJournalError("induced_journal_fault")
+
+    def prepare(self, intent):
+        return self._real.prepare(intent)
+
+    def transition(self, action_id, *, expected_state, expected_revision, new_state, patch=None):
+        if expected_state == self._from and new_state == self._to:
+            raise self._error
+        return self._real.transition(
+            action_id, expected_state=expected_state,
+            expected_revision=expected_revision, new_state=new_state, patch=patch,
+        )
+
+    def load_open_actions(self, run_id):
+        return self._real.load_open_actions(run_id)
+
+    def get_record(self, action_id):
+        return self._real.get_record(action_id)
+
+    def close(self):
+        self._real.close()
+
+
+def _only_record(db: Path) -> dict:
+    return _all_records(db)[-1]
+
+
+def _terminate_only():
+    """A client that terminates on its first step -> the post-recovery loop
+    performs NO extra device action (keeps hook-replay assertions clean)."""
+    return FakeClient([_tool_call({"action": "terminate", "status": "success"})])
+
+
+def _recover(db, pack, tmp_path, *, decide=CONTINUE, adb=None, run_id="r1", settle=0):
+    """Drive the recovery phase once (no model step reached when it stops)."""
+    j = SQLiteActionJournal(str(db))
+    res = runner.run(
+        adb or FakeAdb(), _terminate_only(), pack, tmp_path, settle_s=0,
+        journal=j, run_id=run_id, recovery_decide=(None if decide is None else (lambda _r: decide)),
+        capture_settle_s=settle,
+    )
+    j.close()
+    return res
+
+
+# --- Issue 1: recovery honors the PERSISTED hook_recovery, not the current pack.
+def test_recovery_persisted_not_applicable_never_runs_new_idempotent_hook(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    # Journaled when the pack had NO hook; a later pack version adds an IDEMPOTENT one.
+    _seed_open_action(db, "r1", to_state=EXECUTED, hook_recovery=HOOK_NOT_APPLICABLE)
+    pack = HookReconcilePack()
+    res = _recover(db, pack, tmp_path, decide=CONTINUE)
+    assert pack.hook_replays == []  # the newly-added hook is NEVER replayed
+    assert _only_record(db)["state"] == FINALIZED
+    assert _only_record(db)["hook_applied"] == 0
+    assert res.result == "terminate_success"
+
+
+def test_recovery_persisted_idempotent_rejected_when_current_pack_has_no_hook(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    _seed_open_action(db, "r1", to_state=EXECUTED, hook_recovery=HOOK_IDEMPOTENT)
+    adb = FakeAdb()
+    res = _recover(db, ReconcilePack(), tmp_path, decide=CONTINUE, adb=adb)  # current pack: no hook
+    assert res.result == "invalid_recovery_decision"  # PACK_INCOMPATIBLE, cannot continue
+    assert _only_record(db)["state"] == EXECUTED  # stays open, not replayed
+    assert adb.tap_calls == 0
+
+
+def test_recovery_persisted_idempotent_rejected_when_current_not_replayable(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    _seed_open_action(db, "r1", to_state=EXECUTED, hook_recovery=HOOK_IDEMPOTENT)
+    pack = NotReplayableReconcilePack()
+    res = _recover(db, pack, tmp_path, decide=CONTINUE)
+    assert res.result == "invalid_recovery_decision"
+    assert pack.hook_replays == []
+    assert _only_record(db)["state"] == EXECUTED
+
+
+def test_recovery_persisted_not_replayable_never_calls_hook(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    _seed_open_action(db, "r1", to_state=EXECUTED, hook_recovery=HOOK_NOT_REPLAYABLE)
+    pack = HookReconcilePack()  # current pack IS idempotent, but persisted wins
+    res = _recover(db, pack, tmp_path, decide=CONTINUE)
+    assert res.result == "invalid_recovery_decision"
+    assert pack.hook_replays == []
+    assert _only_record(db)["state"] == EXECUTED
+
+
+# --- Issue 2: pack identity (pack_id + schema) gates reconcile, both sides.
+def test_recovery_different_pack_id_same_schema_is_incompatible(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    # Persisted under a DIFFERENT pack_id but the SAME schema string.
+    _seed_open_action(db, "r1", to_state=OUTCOME_UNKNOWN, pack_id="other-pack", schema=_SCHEMA)
+    pack = SpyReconcilePack()
+    res = _recover(db, pack, tmp_path, decide=CONTINUE)
+    assert res.result == "invalid_recovery_decision"  # PACK_INCOMPATIBLE
+    assert pack.reconcile_calls == 0  # never reconciled across identities
+    assert _only_record(db)["state"] == OUTCOME_UNKNOWN
+
+
+def test_reconcile_pack_missing_pack_id_fails_config_before_any_action(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+
+    class NoPackId(ReconcilePack):
+        pack_id = ""
+
+    j = SQLiteActionJournal(str(tmp_path / "j.db"))
+    adb = FakeAdb()
+    res = runner.run(adb, _click_then_terminate(), NoPackId(), tmp_path, settle_s=0, journal=j, run_id="r1")
+    assert res.result == "journal_config_error"
+    assert res.journal_error_code == "reconcile_pack_id_required"
+    assert adb.tap_calls == 0
+    j.close()
+
+
+def test_reconcile_pack_missing_schema_fails_config_before_any_action(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+
+    class NoSchema(ReconcilePack):
+        reconciliation_schema_version = ""
+
+    j = SQLiteActionJournal(str(tmp_path / "j.db"))
+    adb = FakeAdb()
+    res = runner.run(adb, _click_then_terminate(), NoSchema(), tmp_path, settle_s=0, journal=j, run_id="r1")
+    assert res.result == "journal_config_error"
+    assert res.journal_error_code == "reconcile_schema_required"
+    assert adb.tap_calls == 0
+    j.close()
+
+
+# --- Issue 3: an unstable recovery observation never drives a verdict.
+def test_recovery_unstable_observation_does_not_reconcile_or_close(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    _seed_open_action(db, "r1", to_state=OUTCOME_UNKNOWN)
+    pack = SpyReconcilePack()
+    res = _recover(db, pack, tmp_path, decide=CONTINUE, adb=UnstableAdb(), settle=0)
+    assert pack.reconcile_calls == 0  # unstable -> reconcile skipped (verdict UNKNOWN)
+    assert res.result == "invalid_recovery_decision"
+    assert _only_record(db)["state"] == OUTCOME_UNKNOWN  # stays open
+    # the unstable view is appended as failure evidence
+    assert len(json.loads(_only_record(db)["recovery_observation_refs"])) >= 1
+
+
+# --- Issue 4: the runner only uses the ActionJournal Protocol methods.
+def test_runner_uses_only_protocol_journal_methods(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    real = SQLiteActionJournal(str(tmp_path / "j.db"))
+    j = ProtocolOnlyJournal(real)
+    adb = FakeAdb()
+    res = runner.run(adb, _click_then_terminate(), FakePack(), tmp_path, settle_s=0, journal=j, run_id="r1")
+    assert res.result == "terminate_success"  # no AttributeError from a non-Protocol call
+    assert res.actions_executed == 1
+    real.close()
+
+
+def test_missing_in_flight_record_is_journal_corrupt(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+
+    class DropRecordJournal(ProtocolOnlyJournal):
+        def get_record(self, action_id):  # type: ignore[override]
+            return None
+
+    real = SQLiteActionJournal(str(tmp_path / "j.db"))
+    j = DropRecordJournal(real)
+    with pytest.raises(JournalCorruptError):
+        runner._require_record(j, "r1:obs:1")
+    real.close()
+
+
+# --- Issue 5: journal write failures are never swallowed (explicit journal_error).
+def test_outcome_unknown_write_failure_is_journal_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    j = FaultJournal(SQLiteActionJournal(str(db)), fail_transition=(DISPATCHING, OUTCOME_UNKNOWN))
+    res = runner.run(AdbFailureAdb(), _click_then_terminate(), FakePack(), tmp_path, settle_s=0, journal=j, run_id="r1")
+    assert res.result == "journal_error"
+    assert res.journal_error_code == "JOURNAL_ERROR"
+    j.close()
+
+
+def test_not_executed_write_failure_is_journal_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    j = FaultJournal(SQLiteActionJournal(str(db)), fail_transition=(DISPATCHING, NOT_EXECUTED))
+    res = runner.run(TextCleanAdb(), _click_then_terminate(), FakePack(), tmp_path, settle_s=0, journal=j, run_id="r1")
+    assert res.result == "journal_error"
+    assert res.journal_error_code == "JOURNAL_ERROR"
+    j.close()
+
+
+def test_executed_write_failure_leaves_dispatching_and_no_hook(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    j = FaultJournal(SQLiteActionJournal(str(db)), fail_transition=(DISPATCHING, EXECUTED))
+    adb = FakeAdb()
+    res = runner.run(adb, _click_then_terminate(), FakePack(), tmp_path, settle_s=0, journal=j, run_id="r1")
+    assert res.result == "journal_error"
+    assert adb.tap_calls == 1  # ADB happened once...
+    assert _only_record(db)["state"] == DISPATCHING  # ...but EXECUTED never committed
+    assert not _only_record(db)["hook_applied"]  # hook never ran (NULL while DISPATCHING)
+
+
+def test_hook_raises_leaves_executed_and_never_replays_adb(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    j = SQLiteActionJournal(str(db))
+    adb = FakeAdb()
+    res = runner.run(adb, _click_then_terminate(), RaisingHookPack(), tmp_path, settle_s=0, journal=j, run_id="r1")
+    assert res.result == "post_execute_hook_failed"
+    assert adb.tap_calls == 1  # ADB confirmed, never replayed
+    assert _only_record(db)["state"] == EXECUTED  # hook failure -> stays EXECUTED
+    j.close()
+
+
+def test_finalize_write_failure_after_hook_leaves_executed(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    j = FaultJournal(SQLiteActionJournal(str(db)), fail_transition=(EXECUTED, FINALIZED))
+    pack = HookReconcilePack()
+    res = runner.run(FakeAdb(), _click_then_terminate(), pack, tmp_path, settle_s=0, journal=j, run_id="r1")
+    assert res.result == "journal_error"
+    assert len(pack.hook_replays) == 1  # normal-exec hook DID fire before FINALIZED
+    assert _only_record(db)["state"] == EXECUTED  # FINALIZED never committed
+    j.close()
+
+
+# --- Decision-matrix & reporting coverage.
+def test_not_replayable_recovery_decision_matrix(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    cases = {
+        None: "recovery_required",
+        MANUAL_REVIEW: "recovery_manual_review",
+        TERMINATE: "recovery_terminated",
+        CONTINUE: "invalid_recovery_decision",
+        REPLAN: "invalid_recovery_decision",
+    }
+    for decision, expected in cases.items():
+        db = tmp_path / f"m-{expected}-{decision}.db"
+        _seed_open_action(db, "r1", to_state=EXECUTED, hook_recovery=HOOK_NOT_REPLAYABLE)
+        pack = NotReplayableReconcilePack()
+        res = _recover(db, pack, tmp_path, decide=decision)
+        assert res.result == expected, (decision, expected, res.result)
+        assert pack.hook_replays == []  # NOT_REPLAYABLE: hook never fires
+        assert _only_record(db)["state"] == EXECUTED  # never closed by recovery
+
+
+def test_pack_incompatible_vs_reconciliation_unavailable_reported_separately(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    # (a) reconcile pack but persisted under a different identity -> PACK_INCOMPATIBLE
+    db_a = tmp_path / "a.db"
+    _seed_open_action(db_a, "r1", to_state=OUTCOME_UNKNOWN, pack_id="other-pack", schema=_SCHEMA)
+    res_a = _recover(db_a, SpyReconcilePack(), tmp_path, decide=None)
+    assert res_a.recovery_reports[0].core_fact == PACK_INCOMPATIBLE
+    # (b) a pack with NO reconcile_action at all -> RECONCILIATION_UNAVAILABLE
+    db_b = tmp_path / "b.db"
+    _seed_open_action(db_b, "r1", to_state=OUTCOME_UNKNOWN)
+    res_b = _recover(db_b, FakePack(), tmp_path, decide=None)
+    assert res_b.recovery_reports[0].core_fact == RECONCILIATION_UNAVAILABLE
+
+
+def test_repeated_unknown_recovery_appends_evidence_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    _seed_open_action(db, "r1", to_state=OUTCOME_UNKNOWN)
+    pack = SpyReconcilePack(verdict=UNKNOWN)
+    res1 = _recover(db, pack, tmp_path, decide=CONTINUE)
+    assert res1.result == "invalid_recovery_decision"
+    refs1 = json.loads(_only_record(db)["recovery_observation_refs"])
+    assert len(refs1) == 1 and _only_record(db)["state"] == OUTCOME_UNKNOWN
+    res2 = _recover(db, SpyReconcilePack(verdict=UNKNOWN), tmp_path, decide=CONTINUE)
+    assert res2.result == "invalid_recovery_decision"
+    refs2 = json.loads(_only_record(db)["recovery_observation_refs"])
+    assert len(refs2) == 2  # append-only: never overwritten
+    assert refs2[0] == refs1[0]  # the earlier evidence is preserved
+    assert _only_record(db)["state"] == OUTCOME_UNKNOWN
+
+
+def test_restart_attempt_dir_does_not_overwrite_prior_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    run_dir = tmp_path / "run"
+    # First attempt: a full clean run under run_id r1.
+    j1 = SQLiteActionJournal(str(db))
+    runner.run(FakeAdb(), _click_then_terminate(), FakePack(), run_dir, settle_s=0, journal=j1, run_id="r1")
+    j1.close()
+    attempts = run_dir / "attempts"
+    first_dirs = sorted(p.name for p in attempts.iterdir())
+    assert len(first_dirs) == 1
+    first_jsonl = (attempts / first_dirs[0] / "steps.jsonl").read_bytes()
+    # Second attempt (same run_id, prior action already FINALIZED): a NEW attempt dir.
+    j2 = SQLiteActionJournal(str(db))
+    runner.run(FakeAdb(), _click_then_terminate(), FakePack(), run_dir, settle_s=0, journal=j2, run_id="r1")
+    j2.close()
+    all_dirs = sorted(p.name for p in attempts.iterdir())
+    assert len(all_dirs) == 2  # two isolated attempt dirs
+    # the first attempt's evidence is untouched by the restart
+    assert (attempts / first_dirs[0] / "steps.jsonl").read_bytes() == first_jsonl
 
 
 # --------------------------------------------------------------------------- #

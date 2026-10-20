@@ -296,6 +296,8 @@ class ActionJournal(Protocol):
 
     def load_open_actions(self, run_id: str) -> list[ActionRecord]: ...
 
+    def get_record(self, action_id: str) -> ActionRecord | None: ...
+
 
 # --- Helpers -----------------------------------------------------------------
 
