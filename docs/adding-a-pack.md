@@ -158,6 +158,31 @@ Key points when integrating:
   `BLOCK`. `BLOCK` stops the run (fail-closed; a `resolve` exception or a wrong
   return type is treated as `BLOCK`/`resolve_error`). `REOBSERVE` discards the
   step with zero ADB and re-observes.
+- **Temporarily-unusable targets should `REOBSERVE`, not `BLOCK`.** If a target is
+  only momentarily invisible / not-ready / mid-animation (not a safety violation),
+  `resolve` (or `verify`) should return `REOBSERVE` with a short `reason`; the Core
+  re-observes with zero device side effect. A genuine safety boundary (wrong page,
+  irreversible mismatch, ambiguity that must not be guessed) MUST still return
+  `BLOCK` — the Core never auto-retries a `BLOCK`.
+- **Bounded replan feedback (one-shot, generic).** After any *zero-side-effect*
+  `REOBSERVE` (a `resolve` REOBSERVE, a `verify` REOBSERVE, the Core foreground
+  switch, or the legacy raw-XML-change re-observe), the Core carries a small,
+  bounded fact into the **immediately next** model planning call only: `{source,
+  reason, rejected_action, semantic_target?}` appended as a stable
+  `PREVIOUS_ACTION_REJECTED <json>` line on that one instruction (also logged as
+  `replan_feedback` on the producing step and `replan_feedback_consumed` on the
+  consuming step). It is **one-shot** (replaced if the next step also REOBSERVEs,
+  gone after any allowed action), it is **never** added to the planning `history`,
+  and it **never** creates an Action Journal record or touches ADB. The Core
+  carries runtime facts only — it does not interpret App semantics. The `reason` is
+  length-capped (1024 chars, UTF-8 safe) and defaults to `reobserve_required` when
+  empty. Correction stays **bounded by the existing `max_reobserve`**; at the limit
+  the run still ends with `reobserve_required` (and remains subject to `max_steps` /
+  timeout). A successful allowed action clears the consecutive re-observe streak.
+  Fail-closed paths — `BLOCK`, a `resolve`/`verify` exception or unknown verdict,
+  an invalid `semantic_target`, a whitelist / anti-swap / text-backend rejection,
+  an approve veto, an ADB execution failure, an ambiguous/crash execution window,
+  or a Pack-declared non-retryable error — never emit replan feedback.
 - **A page change is NOT an invalid action.** When the revalidation shows the XML
   moved but the foreground is unchanged, that is expected churn. If the Pack
   implements `verify`, the Core asks it to re-confirm the same `semantic_target`

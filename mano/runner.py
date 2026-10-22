@@ -147,6 +147,30 @@ def _compact(action: dict) -> dict:
     return {key: action[key] for key in _HISTORY_KEYS if key in action}
 
 
+_REPLAN_REASON_MAX = 1024
+_REPLAN_DEFAULT_REASON = "reobserve_required"
+
+
+def _replan_feedback(source: str, reason, rejected_action, semantic_target=None) -> dict:
+    """A thin, bounded correction fact for the NEXT model call after a zero-side-
+    effect REOBSERVE. Core carries runtime facts only (source + Pack/Core reason +
+    the rejected action); it never interprets App semantics."""
+    text = reason if isinstance(reason, str) and reason.strip() else _REPLAN_DEFAULT_REASON
+    fb = {
+        "source": source,
+        "reason": text[:_REPLAN_REASON_MAX],
+        "rejected_action": rejected_action if isinstance(rejected_action, dict) else {},
+    }
+    if isinstance(semantic_target, str) and semantic_target:
+        fb["semantic_target"] = semantic_target
+    return fb
+
+
+def _format_replan_feedback(fb: dict) -> str:
+    """Stable JSON (not string concatenation) appended to the next instruction."""
+    return "PREVIOUS_ACTION_REJECTED " + json.dumps(fb, sort_keys=True, ensure_ascii=False)
+
+
 def _record_text_error(
     record: dict,
     code: str,
@@ -791,6 +815,7 @@ def run(
     wait_streak = 0
     unstable_streak = 0
     reobserve_streak = 0
+    replan_feedback: Optional[dict] = None
     result = "max_steps"
     step = 0
     actions_executed = 0
@@ -828,6 +853,14 @@ def run(
 
         system_prompt = pack.system_prompt(obs.width, obs.height)
         instruction = pack.instruction(history)
+        # One-shot replan feedback: append the last zero-side-effect REOBSERVE fact
+        # to THIS instruction only, then clear it. The Pack's instruction(history)
+        # is called with clean history first, so the rejected action never pollutes
+        # history; the feedback reaches only the immediately next model call.
+        consumed_feedback = replan_feedback
+        replan_feedback = None
+        if consumed_feedback is not None:
+            instruction = instruction + "\n\n" + _format_replan_feedback(consumed_feedback)
         try:
             text, action = propose_action(client, work_dir / obs.screenshot, system_prompt, instruction)
         except ManoError as exc:
@@ -871,6 +904,8 @@ def run(
             "blocked_repeat": False,
             "oscillating": False,
             "note": "",
+            "replan_feedback": None,
+            "replan_feedback_consumed": consumed_feedback,
         }
 
         # Resolve verdict gate (before validation / classification): the Pack may
@@ -891,6 +926,8 @@ def run(
             reobserve_streak += 1
             reobserves += 1
             record["note"] = "reobserve_required"
+            replan_feedback = _replan_feedback("resolve", decision.reason, action)
+            record["replan_feedback"] = replan_feedback
             log(record)
             if reobserve_streak >= max_reobserve:
                 result = "reobserve_required"
@@ -1000,6 +1037,11 @@ def run(
             reobserve_streak += 1
             reobserves += 1
             record["note"] = "reobserve_required"
+            replan_feedback = _replan_feedback(
+                "foreground_changed", "foreground_changed_before_execute",
+                resolved, decision.semantic_target,
+            )
+            record["replan_feedback"] = replan_feedback
             log(record)
             if reobserve_streak >= max_reobserve:
                 result = "reobserve_required"
@@ -1029,6 +1071,10 @@ def run(
                 reobserve_streak += 1
                 reobserves += 1
                 record["note"] = "reobserve_required"
+                replan_feedback = _replan_feedback(
+                    "verify", verification.reason, resolved, decision.semantic_target,
+                )
+                record["replan_feedback"] = replan_feedback
                 log(record)
                 if reobserve_streak >= max_reobserve:
                     result = "reobserve_required"
@@ -1065,6 +1111,10 @@ def run(
                 reobserve_streak += 1
                 reobserves += 1
                 record["note"] = "reobserve_required"
+                replan_feedback = _replan_feedback(
+                    "legacy_xml_changed", "raw_xml_changed", resolved, decision.semantic_target,
+                )
+                record["replan_feedback"] = replan_feedback
                 log(record)
                 if reobserve_streak >= max_reobserve:
                     result = "reobserve_required"

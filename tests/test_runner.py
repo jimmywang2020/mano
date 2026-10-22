@@ -700,3 +700,281 @@ def test_text_error_retryable_preserved_in_log(tmp_path, monkeypatch):
     assert rec["text_error_code"] == "text_backend_preflight_failed"
     assert rec["text_retryable"] is True
     assert rec["action_may_have_executed"] is False
+
+
+# --- Round 3: bounded replan feedback after a zero-side-effect REOBSERVE -------
+
+
+class RecordingClient(FakeClient):
+    """Captures the user instruction text handed to each model call so a test can
+    prove exactly which call the one-shot replan feedback reached."""
+
+    def __init__(self, scripts: list[str]) -> None:
+        super().__init__(scripts)
+        self.instructions: list[str] = []
+
+    def complete(self, messages, max_tokens: int = 700):
+        self.instructions.append(messages[1]["content"][0]["text"])
+        return super().complete(messages, max_tokens)
+
+
+class ResolveReplanPack(FakePack):
+    """resolve REOBSERVEs the first ``reobserve_times`` proposals, then passes the
+    proposal through (ALLOW). It also records the history it is handed each step."""
+
+    def __init__(self, *, reobserve_times: int = 1, reason: str = "need_more_context") -> None:
+        super().__init__()
+        self._reobserve_times = reobserve_times
+        self._reason = reason
+        self.resolve_calls = 0
+        self.seen_history: list[list] = []
+
+    def instruction(self, history) -> str:
+        self.seen_history.append(list(history))
+        return "inst"
+
+    def resolve(self, *, proposed_action, observation, model_text) -> ResolveDecision:
+        self.resolve_calls += 1
+        if self.resolve_calls <= self._reobserve_times:
+            return ResolveDecision(
+                verdict=REOBSERVE, semantic_target="", resolved_action={}, reason=self._reason
+            )
+        return super().resolve(
+            proposed_action=proposed_action, observation=observation, model_text=model_text
+        )
+
+
+class VerifyReplanPack(FakePack):
+    """resolve passes through; verify REOBSERVEs the first ``reobserve_times``
+    device steps, then ALLOWs the same payload (never an anti-swap)."""
+
+    def __init__(
+        self, *, reobserve_times: int = 1, reason: str = "ui_not_settled", allow_action=None
+    ) -> None:
+        super().__init__()
+        self._reobserve_times = reobserve_times
+        self._reason = reason
+        # verify's ``approved_intent`` is the semantic_target STRING, not the
+        # resolved action, so the ALLOW payload is supplied up front; only its
+        # coordinate may differ (anti-swap excludes coordinates).
+        self._allow_action = allow_action or {"action": "click", "coordinate": [150, 150]}
+        self.verify_calls = 0
+
+    def verify(self, *, approved_intent, fresh_observation) -> VerificationResult:
+        self.verify_calls += 1
+        if self.verify_calls <= self._reobserve_times:
+            return VerificationResult(verdict=REOBSERVE, resolved_action={}, reason=self._reason)
+        return VerificationResult(verdict=ALLOW, resolved_action=dict(self._allow_action))
+
+
+def _feedback_payload(instruction: str) -> dict:
+    marker = "PREVIOUS_ACTION_REJECTED"
+    assert marker in instruction
+    return json.loads(instruction.split(marker, 1)[1])
+
+
+# A. resolve REOBSERVE -> the rejected proposal + reason reach the NEXT call only.
+def test_resolve_reobserve_carries_rejected_action_into_next_model_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    rejected = {"action": "click", "coordinate": [100, 100]}
+    client = RecordingClient(
+        [
+            _tool_call(rejected),
+            _tool_call({"action": "click", "coordinate": [200, 200]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(
+        adb, client, ResolveReplanPack(reason="need_more_context"), tmp_path, max_steps=10, settle_s=0
+    )
+    assert res.result == "terminate_success"
+    # the REOBSERVE touched no device; only the second (corrected) click ran.
+    assert adb.tap_calls == 1
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[0]
+    payload = _feedback_payload(client.instructions[1])
+    assert payload["source"] == "resolve"
+    assert payload["reason"] == "need_more_context"
+    assert payload["rejected_action"] == rejected
+    # audit: step 1 produced the feedback (0 ADB), step 2 consumed the same fact.
+    recs = _records(tmp_path)
+    step1 = [r for r in recs if r["step"] == 1][-1]
+    step2 = [r for r in recs if r["step"] == 2][-1]
+    assert step1["replan_feedback"]["source"] == "resolve"
+    assert step1["executed"] is False
+    assert step2["replan_feedback_consumed"] == step1["replan_feedback"]
+
+
+# B. verify REOBSERVE -> the reverted resolved action + verify reason reach next.
+def test_verify_reobserve_carries_rejected_action_into_next_model_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    rejected = {"action": "click", "coordinate": [150, 150]}
+    client = RecordingClient(
+        [
+            _tool_call(rejected),
+            _tool_call({"action": "click", "coordinate": [150, 150]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(
+        adb, client, VerifyReplanPack(reason="ui_not_settled"), tmp_path, max_steps=10, settle_s=0
+    )
+    assert res.result == "terminate_success"
+    assert adb.tap_calls == 1  # verify REOBSERVE executed nothing; the retry did.
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[0]
+    payload = _feedback_payload(client.instructions[1])
+    assert payload["source"] == "verify"
+    assert payload["reason"] == "ui_not_settled"
+    assert payload["rejected_action"] == rejected
+    assert payload["semantic_target"] == "target:click:150,150"
+
+
+# C. Bounded: resolve REOBSERVEs forever, but max_reobserve still terminates with
+#    the existing result and zero device actions on every round.
+def test_replan_feedback_is_bounded_by_max_reobserve(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    client = RecordingClient(
+        [_tool_call({"action": "click", "coordinate": [i * 10, i * 10]}) for i in range(1, 6)]
+    )
+    res = runner.run(
+        adb, client, ResolveReplanPack(reobserve_times=99, reason="still_bad"),
+        tmp_path, max_steps=10, settle_s=0, max_reobserve=3,
+    )
+    assert res.result == "reobserve_required"
+    assert res.reobserves == 3
+    assert adb.tap_calls == 0  # every step was a zero-side-effect REOBSERVE.
+    # the feedback is replaced each round (consumed by the immediately next call).
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[0]
+    assert "PREVIOUS_ACTION_REJECTED" in client.instructions[1]
+    assert "PREVIOUS_ACTION_REJECTED" in client.instructions[2]
+
+
+# D. BLOCK is fail-closed: never produces replan feedback.
+def test_block_verdict_sets_no_replan_feedback(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    client = RecordingClient([_tool_call({"action": "click", "coordinate": [100, 100]})])
+    res = runner.run(adb, client, VerdictHookPack(BLOCK), tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "resolve_blocked"
+    assert adb.tap_calls == 0
+    assert _records(tmp_path)[-1]["replan_feedback"] is None
+
+
+# E. An unknown verdict and a resolve exception are both fail-closed: no feedback.
+def test_illegal_verdict_and_resolve_exception_set_no_replan_feedback(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+
+    adb1 = FakeAdb()
+    res1 = runner.run(
+        adb1, RecordingClient([_tool_call({"action": "click", "coordinate": [1, 1]})]),
+        VerdictHookPack("weird"), tmp_path / "bad", max_steps=10, settle_s=0,
+    )
+    assert res1.result == "invalid_resolve_verdict"
+    assert adb1.tap_calls == 0
+    assert _records(tmp_path / "bad")[-1]["replan_feedback"] is None
+
+    class BoomPack(FakePack):
+        def resolve(self, *, proposed_action, observation, model_text):
+            raise RuntimeError("boom")
+
+    adb2 = FakeAdb()
+    res2 = runner.run(
+        adb2, RecordingClient([_tool_call({"action": "click", "coordinate": [1, 1]})]),
+        BoomPack(), tmp_path / "boom", max_steps=10, settle_s=0,
+    )
+    assert res2.result == "resolve_error"
+    assert adb2.tap_calls == 0
+    assert _records(tmp_path / "boom")[-1]["replan_feedback"] is None
+
+
+# F. One-shot: the feedback reaches ONLY the immediately next call, then is gone.
+def test_replan_feedback_is_one_shot(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    client = RecordingClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),  # rejected
+            _tool_call({"action": "click", "coordinate": [200, 200]}),  # executes
+            _tool_call({"action": "click", "coordinate": [300, 300]}),  # executes
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    runner.run(adb, client, ResolveReplanPack(reobserve_times=1), tmp_path, max_steps=10, settle_s=0)
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[0]
+    assert "PREVIOUS_ACTION_REJECTED" in client.instructions[1]  # consumed here ...
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[2]  # ... not repeated
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[3]
+
+
+# G. The rejected action never enters the history the Pack plans against.
+def test_replan_feedback_does_not_pollute_pack_history(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    pack = ResolveReplanPack(reobserve_times=1)
+    client = RecordingClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),  # rejected
+            _tool_call({"action": "click", "coordinate": [200, 200]}),  # executes
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+    # history handed to the Pack on the retry step is still empty (the rejected
+    # action was never committed), even though the model saw the feedback.
+    assert pack.seen_history[0] == []
+    assert pack.seen_history[1] == []
+    assert pack.seen_history[2] and pack.seen_history[2][-1]["action"] == "click"
+    assert pack.seen_history[2][-1]["coordinate"] == [200, 200]
+
+
+# H. The reason is length-capped, unicode-safe, and defaults when empty.
+def test_replan_reason_is_bounded_truncated_and_unicode_safe(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    long_reason = "需" * 2000  # unicode + well over the 1024 cap
+    adb = FakeAdb()
+    client = RecordingClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "click", "coordinate": [200, 200]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    runner.run(adb, client, ResolveReplanPack(reason=long_reason), tmp_path, max_steps=10, settle_s=0)
+    payload = _feedback_payload(client.instructions[1])
+    assert len(payload["reason"]) == 1024
+    assert payload["reason"] == long_reason[:1024]  # unicode intact, not mojibake
+
+
+def test_replan_reason_defaults_when_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    client = RecordingClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "click", "coordinate": [200, 200]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    runner.run(adb, client, ResolveReplanPack(reason=""), tmp_path, max_steps=10, settle_s=0)
+    payload = _feedback_payload(client.instructions[1])
+    assert payload["reason"] == "reobserve_required"
+
+
+# J. Existing behavior regression: a run with no REOBSERVE never emits feedback.
+def test_no_reobserve_run_never_emits_replan_feedback(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    client = RecordingClient(
+        [
+            _tool_call({"action": "click", "coordinate": [100, 100]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(adb, client, FakePack(), tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "terminate_success"
+    assert all("PREVIOUS_ACTION_REJECTED" not in inst for inst in client.instructions)
+    for rec in _records(tmp_path):
+        assert rec["replan_feedback"] is None
+        assert rec["replan_feedback_consumed"] is None

@@ -66,7 +66,7 @@ from mano.action_journal import (  # noqa: E402
     JournalCorruptError,
     SQLiteActionJournal,
 )
-from mano.pack import ALLOW, ReconciliationResult, ResolveDecision  # noqa: E402
+from mano.pack import ALLOW, REOBSERVE, ReconciliationResult, ResolveDecision  # noqa: E402
 
 _SCHEMA = "recon-v1"
 _PACK_ID = "reconcile-pack"
@@ -1115,6 +1115,40 @@ def test_observation_refs_carry_capture_timing(tmp_path, monkeypatch):
     refs = json.loads(_only_record(db2)["recovery_observation_refs"])
     assert len(refs) == 1
     assert {"capture_started_at", "capture_finished_at", "skew_ms", "stability"} <= set(refs[0])
+
+
+# --- Round 3: a zero-side-effect REOBSERVE never prepares a journal action. ----
+class ResolveReobservePack(FakePack):
+    """resolve REOBSERVEs every proposal (a temporarily-unusable target)."""
+
+    def __init__(self, *, reason: str = "still_bad") -> None:
+        self._reason = reason
+        self.resolve_calls = 0
+
+    def resolve(self, *, proposed_action, observation, model_text) -> ResolveDecision:
+        self.resolve_calls += 1
+        return ResolveDecision(
+            verdict=REOBSERVE, semantic_target="", resolved_action={}, reason=self._reason
+        )
+
+
+def test_resolve_reobserve_creates_no_journal_record(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    j = SQLiteActionJournal(str(db))
+    adb = FakeAdb()
+    client = FakeClient(
+        [_tool_call({"action": "click", "coordinate": [i, i]}) for i in range(1, 6)]
+    )
+    res = runner.run(
+        adb, client, ResolveReobservePack(), tmp_path, settle_s=0,
+        journal=j, run_id="r1", max_reobserve=3,
+    )
+    j.close()
+    assert res.result == "reobserve_required"
+    assert adb.tap_calls == 0  # bounded, zero device actions.
+    # The journal was opened but a REOBSERVE must never prepare/commit an action.
+    assert _all_records(db) == []
 
 
 # --------------------------------------------------------------------------- #

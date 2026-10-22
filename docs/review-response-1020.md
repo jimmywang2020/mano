@@ -82,3 +82,76 @@ Reviewer 复核 `2833eb9` 核销了上一轮 5 项，但发现 EXECUTED IDEMPOTE
 
 验收标准（reviewer 指定）：既有 198 全绿 + 新组合测试全绿；错误 Pack 复现
 `core_fact=PACK_INCOMPATIBLE / hook_replays=0 / state=EXECUTED`；`git diff --check` 无输出。
+
+---
+
+## Round 3（基于 `2789339` 复核）— 无设备副作用失败后的有界自动纠正规划
+
+Reviewer 要求：为 Mano Core 增加「零设备副作用 REOBSERVE 后，把失败事实有界地带入
+下一次模型规划」的通用薄反馈，不进 Action Journal、不执行/回放 ADB、Core 不含任何
+App 语义。复用现有 `ResolveDecision.reason` / `VerificationResult.reason` / `max_reobserve`，
+不新增公共 ABI。所有 pytest / git 由用户执行；commit hash 留占位符。
+
+### 设计（薄、通用、有界）
+
+- 一个循环局部变量 `replan_feedback: Optional[dict]`（`runner.run` 循环初始化）。
+- 在**四个**零副作用 REOBSERVE 分支置位：`resolve` REOBSERVE、`verify` REOBSERVE、
+  Core 前台切换（`reval.foreground_changed`）、legacy raw-XML 变化回退。载荷
+  `{source, reason, rejected_action, semantic_target?}`。
+- 下一轮循环顶端构造 instruction 时**消费一次**：先调 `pack.instruction(history)`
+  （history 干净，拒绝动作永不入 history），再把 `PREVIOUS_ACTION_REJECTED <json>`
+  （`json.dumps(..., sort_keys=True, ensure_ascii=False)`）追加到该次 instruction，
+  随即清空（一次性；若下步又 REOBSERVE 则替换）。
+- 审计：产出步记 `replan_feedback`，消费步记 `replan_feedback_consumed`。
+- `reason` 截断 1024 字符、UTF-8 安全、空则默认 `reobserve_required`。
+- 有界：沿用 `max_reobserve`；到限仍以既有 `result="reobserve_required"` 结束，
+  并受 `max_steps`/timeout 约束；成功执行允许动作后清零连续 REOBSERVE 计数。
+- Fail-closed（**不**纠正）：`BLOCK`、resolve/verify 异常或未知 verdict、非法
+  `semantic_target`、whitelist / anti-swap / 文本后端拒绝、approve 否决、ADB 执行
+  失败、模糊/崩溃执行窗口、Pack 声明不可重试 —— 这些分支一律不置 `replan_feedback`。
+
+### 规范 — 实现 — 测试 映射表
+
+| 项 | 规范 | 实现（真实函数） | 测试 |
+|---|---|---|---|
+| A | resolve REOBSERVE：把 `reason` + 被拒 `proposed_action` 带入下一次模型调用 | `runner.run` resolve REOBSERVE 分支置 `_replan_feedback("resolve", decision.reason, action)` | `test_resolve_reobserve_carries_rejected_action_into_next_model_call` |
+| B | verify REOBSERVE：把 `verify` reason + 回退的 resolved 动作 + `semantic_target` 带入下一次 | verify REOBSERVE 分支 `_replan_feedback("verify", verification.reason, resolved, semantic_target)` | `test_verify_reobserve_carries_rejected_action_into_next_model_call` |
+| C | 有界：持续 REOBSERVE 仍受 `max_reobserve` 终止、零 ADB | 四分支共用 `if reobserve_streak >= max_reobserve: result="reobserve_required"; break` | `test_replan_feedback_is_bounded_by_max_reobserve` |
+| D | `BLOCK` 永不触发纠正 | BLOCK 分支不置 `replan_feedback` | `test_block_verdict_sets_no_replan_feedback` |
+| E | 非法 verdict / resolve 异常 fail-closed，不纠正 | `_safe_resolve` 异常→BLOCK；未知 verdict→`invalid_resolve_verdict`（均不置位） | `test_illegal_verdict_and_resolve_exception_set_no_replan_feedback` |
+| F | 一次性：仅紧邻的下一次模型调用可见 | 顶端消费后 `replan_feedback = None` | `test_replan_feedback_is_one_shot` |
+| G | 拒绝动作不污染 Pack 规划用 `history` | 先 `pack.instruction(history)` 后追加反馈；history 永不含拒绝动作 | `test_replan_feedback_does_not_pollute_pack_history` |
+| H | `reason` 有界/截断/Unicode 安全/默认 | `runner._replan_feedback`（`text[:1024]`，空→`reobserve_required`）+ `_format_replan_feedback`（`ensure_ascii=False, sort_keys=True`） | `test_replan_reason_is_bounded_truncated_and_unicode_safe`、`test_replan_reason_defaults_when_empty` |
+| I | journal 边界：零副作用 REOBSERVE 绝不 prepare/提交 journal 动作 | 四分支均在 `prepare` 之前；journal 模式同样零记录 | `test_resolve_reobserve_creates_no_journal_record`（journal 实盘 `actions` 表为空） |
+| J | 既有行为回归：无 REOBSERVE 的 run 永不发反馈 | 默认 `replan_feedback=None`，record 默认 `replan_feedback/_consumed=None` | `test_no_reobserve_run_never_emits_replan_feedback` |
+
+> A/B/C/D/E/F/G/H/J 位于 `tests/test_runner.py`（薄 runner 通用回路）；I 位于
+> `tests/test_runner_journal.py`（真实 SQLite journal）。
+
+### 文档同步
+
+- `docs/adding-a-pack.md`：resolve/verify 回路节新增三点 —— ①临时不可用目标应
+  `REOBSERVE`（安全边界仍必须 `BLOCK`）；②Core 把有界 `reason`/`rejected_action`
+  一次性带入下一次模型规划（不入 history、不入 journal、不碰 ADB、Core 不含 App 语义）；
+  ③所有 fail-closed 窗口永不自动纠正。
+- `docs/action-journal-design.md`：冻结于 `d556840`，未改。
+- Core 内零 App 语义（无「转转 / 容量 / 128G / 筛选栏目」等）。
+
+### 交付给用户（执行者/本地）
+
+1. 跑验证：
+   ```bash
+   uv run --extra dev pytest -q
+   git diff --check
+   ```
+2. 暂存（**排除** Duolingo 运行产物与 lock）：
+   ```bash
+   git add mano/runner.py tests/test_runner.py tests/test_runner_journal.py \
+           docs/adding-a-pack.md docs/review-response-1020.md
+   git status --short   # 确认未混入 packs/duolingo/*, uv.lock 等
+   ```
+3. commit + push + `git rev-parse HEAD`（hash：`<执行者 push 后回填>`）。
+
+验收标准（reviewer 指定）：全量 pytest 绿 + 新测试绿；REOBSERVE 路径 0 ADB / 0 journal
+动作；`rejected_action` 不入成功 history；`max_reobserve` 仍能终止；`BLOCK` 与所有不确定
+窗口永不自动重试；Core 无 App 语义；`git diff --check` 无输出。
