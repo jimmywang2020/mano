@@ -147,11 +147,15 @@ App 语义。复用现有 `ResolveDecision.reason` / `VerificationResult.reason`
 2. 暂存（**排除** Duolingo 运行产物与 lock）：
    ```bash
    git add mano/runner.py tests/test_runner.py tests/test_runner_journal.py \
-           docs/adding-a-pack.md docs/review-response-1020.md
+           docs/adding-a-pack.md docs/review-response-1020.md docs/harness-rules.md
    git status --short   # 确认未混入 packs/duolingo/*, uv.lock 等
    ```
-3. commit + push + `git rev-parse HEAD`（hash：`<执行者 push 后回填>`）。
+3. commit + push + `git rev-parse HEAD`（hash：`47aaa09841ba04e99f40fd25ee814c485016cb31`）。
 
 验收标准（reviewer 指定）：全量 pytest 绿 + 新测试绿；REOBSERVE 路径 0 ADB / 0 journal
 动作；`rejected_action` 不入成功 history；`max_reobserve` 仍能终止；`BLOCK` 与所有不确定
 窗口永不自动重试；Core 无 App 语义；`git diff --check` 无输出。
+
+> 落地：本轮已以 `47aaa09841ba04e99f40fd25ee814c485016cb31` push（`2789339..47aaa09`，
+> 6 files changed）；采购助手生产回执（2026-10-23）确认该 pin 本机 `215 passed`、并已把
+> Mano 提升为默认采样后端（V-01 保留为显式回退）。
