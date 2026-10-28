@@ -907,8 +907,8 @@ def test_wait_resets_reobserve_streak(tmp_path, monkeypatch):
     assert adb.tap_calls == 0
 
 
-# A1: resolve returns an out-of-range coordinate -> fail closed, zero ADB ------
-def test_resolve_out_of_range_coordinate_fails_closed(tmp_path, monkeypatch):
+# A1: resolve returns an out-of-range coordinate -> bounded re-plan, zero ADB --
+def test_resolve_out_of_range_coordinate_routes_into_bounded_replan(tmp_path, monkeypatch):
     _silence_sleep(monkeypatch)
     adb = ScriptedAdb()
 
@@ -920,14 +920,24 @@ def test_resolve_out_of_range_coordinate_fails_closed(tmp_path, monkeypatch):
         )
 
     pack = FakePack(resolve_fn=resolve_fn)
-    client = FakeClient([_tool_call({"action": "click", "coordinate": [100, 100]})])
-    res = runner.run(adb, client, pack, tmp_path, max_steps=5, settle_s=0, capture_settle_s=0)
+    # The model keeps being asked to re-plan; every round is a zero-side-effect
+    # re-observe until max_reobserve ends the run with reobserve_required.
+    client = FakeClient(
+        [_tool_call({"action": "click", "coordinate": [100, 100]}) for _ in range(3)]
+    )
+    res = runner.run(
+        adb, client, pack, tmp_path, max_steps=5, settle_s=0, capture_settle_s=0, max_reobserve=3
+    )
 
-    assert res.result == "resolve_invalid_action"
-    assert adb.tap_calls == 0
+    assert res.result == "reobserve_required"
+    assert res.reobserves == 3
+    assert adb.tap_calls == 0  # an out-of-range coordinate is never clamped or executed.
     first = _records(tmp_path)[0]
-    assert first["note"] == "resolve_invalid_action"
+    assert first["note"] == "reobserve_required"
     assert first["resolve_reason"] == "bad_coordinate"
+    assert first["executed"] is False
+    assert first["replan_feedback"]["reason"] == "bad_coordinate"
+    assert first["replan_feedback"]["coordinate_space"] == "0..1000 per axis"
 
 
 # A1: resolve returns an unknown action -> fail closed ------------------------

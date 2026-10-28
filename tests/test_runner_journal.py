@@ -1151,6 +1151,26 @@ def test_resolve_reobserve_creates_no_journal_record(tmp_path, monkeypatch):
     assert _all_records(db) == []
 
 
+def test_bad_coordinate_replan_creates_no_journal_record(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    db = tmp_path / "j.db"
+    j = SQLiteActionJournal(str(db))
+    adb = FakeAdb()
+    # Pack ALLOWs each proposal; Core rejects the out-of-range coordinate and
+    # re-plans. No prepare/dispatch/execute may ever be journalled for those rounds.
+    client = FakeClient(
+        [_tool_call({"action": "click", "coordinate": [1200, 1200]}) for _ in range(5)]
+    )
+    res = runner.run(
+        adb, client, FakePack(), tmp_path, settle_s=0,
+        journal=j, run_id="r1", max_reobserve=3,
+    )
+    j.close()
+    assert res.result == "reobserve_required"
+    assert adb.tap_calls == 0  # every illegal round was a zero-side-effect re-plan.
+    assert _all_records(db) == []
+
+
 # --------------------------------------------------------------------------- #
 # Crash-child entrypoint: run ONE real Runner step and self-SIGKILL at <window>.
 # --------------------------------------------------------------------------- #

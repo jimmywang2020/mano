@@ -978,3 +978,119 @@ def test_no_reobserve_run_never_emits_replan_feedback(tmp_path, monkeypatch):
     for rec in _records(tmp_path):
         assert rec["replan_feedback"] is None
         assert rec["replan_feedback_consumed"] is None
+
+
+# --- bad_coordinate / bad_coordinate2: ALLOW + out-of-range coords now re-plan --
+
+
+# K. A resolved click whose coordinate is out of 0..1000 is corrected on the next
+#    call; the illegal round touches no device and carries the 0..1000 contract.
+def test_bad_coordinate_resolve_routes_into_bounded_replan(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    rejected = {"action": "click", "coordinate": [545, 1487]}  # y past 1000
+    client = RecordingClient(
+        [
+            _tool_call(rejected),
+            _tool_call({"action": "click", "coordinate": [200, 200]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(adb, client, FakePack(), tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "terminate_success"
+    assert adb.tap_calls == 1  # illegal round executed nothing; only the fix ran.
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[0]
+    payload = _feedback_payload(client.instructions[1])
+    assert payload["source"] == "resolve_invalid_action"
+    assert payload["reason"] == "bad_coordinate"
+    assert payload["rejected_action"] == rejected
+    assert payload["semantic_target"] == "target:click:545,1487"
+    assert payload["coordinate_space"] == "0..1000 per axis"
+    recs = _records(tmp_path)
+    step1 = [r for r in recs if r["step"] == 1][-1]
+    step2 = [r for r in recs if r["step"] == 2][-1]
+    assert step1["executed"] is False
+    assert step1["resolve_reason"] == "bad_coordinate"
+    assert step1["replan_feedback"]["reason"] == "bad_coordinate"
+    assert step2["replan_feedback_consumed"] == step1["replan_feedback"]
+
+
+# L. A swipe whose END point is out of range reports bad_coordinate2 and is
+#    likewise correctable with zero device actions on the illegal round.
+def test_bad_coordinate2_resolve_routes_into_bounded_replan(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    rejected = {"action": "swipe", "coordinate": [500, 500], "coordinate2": [585, 1256]}
+    client = RecordingClient(
+        [
+            _tool_call(rejected),
+            _tool_call({"action": "swipe", "coordinate": [500, 500], "coordinate2": [500, 300]}),
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    res = runner.run(adb, client, FakePack(), tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "terminate_success"
+    assert adb.swipe_calls == 1
+    assert adb.tap_calls == 0
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[0]
+    payload = _feedback_payload(client.instructions[1])
+    assert payload["source"] == "resolve_invalid_action"
+    assert payload["reason"] == "bad_coordinate2"
+    assert payload["rejected_action"] == rejected
+    assert payload["coordinate_space"] == "0..1000 per axis"
+
+
+# M. Bounded: the model keeps returning out-of-range coords; max_reobserve still
+#    stops with the existing result and zero device actions on every round.
+def test_bad_coordinate_replan_is_bounded_by_max_reobserve(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    client = RecordingClient(
+        [_tool_call({"action": "click", "coordinate": [1200, 1200]}) for _ in range(5)]
+    )
+    res = runner.run(
+        adb, client, FakePack(), tmp_path, max_steps=10, settle_s=0, max_reobserve=3
+    )
+    assert res.result == "reobserve_required"
+    assert res.reobserves == 3
+    assert adb.tap_calls == 0  # every illegal round was a zero-side-effect re-plan.
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[0]
+    assert "PREVIOUS_ACTION_REJECTED" in client.instructions[1]
+    assert "PREVIOUS_ACTION_REJECTED" in client.instructions[2]
+
+
+# N. One-shot + history: the feedback reaches only the next call and the rejected
+#    (never-committed) action never enters the history the Pack plans against.
+def test_bad_coordinate_replan_is_one_shot_and_keeps_history_clean(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()
+    pack = ResolveReplanPack(reobserve_times=0)  # always passthrough + records history
+    client = RecordingClient(
+        [
+            _tool_call({"action": "click", "coordinate": [1200, 1200]}),  # bad -> re-plan
+            _tool_call({"action": "click", "coordinate": [200, 200]}),  # executes
+            _tool_call({"action": "terminate", "status": "success"}),
+        ]
+    )
+    runner.run(adb, client, pack, tmp_path, max_steps=10, settle_s=0)
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[0]
+    assert "PREVIOUS_ACTION_REJECTED" in client.instructions[1]  # consumed here ...
+    assert "PREVIOUS_ACTION_REJECTED" not in client.instructions[2]  # ... not repeated
+    assert pack.seen_history[0] == []
+    assert pack.seen_history[1] == []  # the rejected action did not pollute history
+    assert pack.seen_history[2] and pack.seen_history[2][-1]["coordinate"] == [200, 200]
+
+
+# O. Regression: a non-coordinate validation code (charset) still fails closed as
+#    resolve_invalid_action and is NOT treated as a correctable re-plan.
+def test_text_unsupported_still_ends_not_replanned(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a, **_k: None)
+    adb = FakeAdb()  # no text_backend -> default ASCII rejects non-ASCII text
+    client = RecordingClient([_tool_call({"action": "type", "text": "中文"})])
+    res = runner.run(adb, client, FakePack(), tmp_path, max_steps=10, settle_s=0)
+    assert res.result == "resolve_invalid_action"
+    assert adb.type_calls == 0
+    assert all("PREVIOUS_ACTION_REJECTED" not in inst for inst in client.instructions)
+    rec = _records(tmp_path)[-1]
+    assert rec["resolve_reason"] == "text_unsupported_by_backend"
+    assert rec["replan_feedback"] is None

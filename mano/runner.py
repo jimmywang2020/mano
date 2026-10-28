@@ -109,6 +109,11 @@ _TEXT_ERROR_CODES = frozenset(
     }
 )
 
+# Resolve-time validation codes that a *re-plan* can fix: out-of-range coordinates
+# are a correctable, zero-side-effect miss (the model just needs the 0..1000
+# contract restated), unlike charset/structural errors which stay fail-closed.
+_REPLAN_RESOLVE_INVALID_CODES = frozenset({"bad_coordinate", "bad_coordinate2"})
+
 # Stable journal/recovery result codes (Core facts, never the Consumer's business
 # states like NEEDS_HUMAN_REVIEW). journal_config_error = run_id / hook-ABI
 # preflight failed; journal_error = a CAS conflict / DB busy / corrupt journal
@@ -151,10 +156,11 @@ _REPLAN_REASON_MAX = 1024
 _REPLAN_DEFAULT_REASON = "reobserve_required"
 
 
-def _replan_feedback(source: str, reason, rejected_action, semantic_target=None) -> dict:
+def _replan_feedback(source: str, reason, rejected_action, semantic_target=None, *, extra=None) -> dict:
     """A thin, bounded correction fact for the NEXT model call after a zero-side-
     effect REOBSERVE. Core carries runtime facts only (source + Pack/Core reason +
-    the rejected action); it never interprets App semantics."""
+    the rejected action); it never interprets App semantics. ``extra`` adds only
+    stable Core-level facts (e.g. its own 0..1000 coordinate contract)."""
     text = reason if isinstance(reason, str) and reason.strip() else _REPLAN_DEFAULT_REASON
     fb = {
         "source": source,
@@ -163,6 +169,10 @@ def _replan_feedback(source: str, reason, rejected_action, semantic_target=None)
     }
     if isinstance(semantic_target, str) and semantic_target:
         fb["semantic_target"] = semantic_target
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if isinstance(key, str) and key not in fb:
+                fb[key] = value
     return fb
 
 
@@ -948,6 +958,26 @@ def run(
         # change) with a stable error code; never crash the run.
         invalid = validate_executable_action(adb, resolved)
         if invalid is not None:
+            # Out-of-range coordinates are a correctable, zero-side-effect miss:
+            # route them into the same bounded replan as REOBSERVE (no approve /
+            # verify / ADB / journal), restating only the Core's own 0..1000
+            # contract. The Core never clamps, scales, guesses or executes the
+            # illegal coordinate. All other codes stay fail-closed as before.
+            if invalid in _REPLAN_RESOLVE_INVALID_CODES:
+                reobserve_streak += 1
+                reobserves += 1
+                record["note"] = "reobserve_required"
+                record["resolve_reason"] = invalid
+                replan_feedback = _replan_feedback(
+                    "resolve_invalid_action", invalid, resolved,
+                    decision.semantic_target, extra={"coordinate_space": "0..1000 per axis"},
+                )
+                record["replan_feedback"] = replan_feedback
+                log(record)
+                if reobserve_streak >= max_reobserve:
+                    result = "reobserve_required"
+                    break
+                continue
             record["note"] = "resolve_invalid_action"
             record["resolve_reason"] = invalid
             if invalid in _TEXT_ERROR_CODES:
