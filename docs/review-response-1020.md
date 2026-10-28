@@ -159,3 +159,94 @@ App 语义。复用现有 `ResolveDecision.reason` / `VerificationResult.reason`
 > 落地：本轮已以 `47aaa09841ba04e99f40fd25ee814c485016cb31` push（`2789339..47aaa09`，
 > 6 files changed）；采购助手生产回执（2026-10-23）确认该 pin 本机 `215 passed`、并已把
 > Mano 提升为默认采样后端（V-01 保留为显式回退）。
+
+---
+
+## Round 4（基于 `47aaa09` 生产回执）— resolve-ALLOW 越界坐标纳入有界重规划
+
+采购助手真机回执：模型给出 y 超出坐标空间（`0..1000`）的 ALLOW 动作时，Core 在
+resolve 后的 `validate_executable_action` 返回 `bad_coordinate`/`bad_coordinate2`，
+旧路径直接以 `resolve_invalid_action` 结束整次运行，**未**进入已有的零副作用有界重
+规划（Round 3 机制）。本轮把且仅把这两个越界坐标码接入既有重规划回路，其余校验码
+保持 fail-closed。复用 Round 3 的 `replan_feedback` / `max_reobserve`，不新增公共 ABI，
+Core 不含 App 语义，不 clamp / scale / guess / 执行非法坐标。
+
+### 设计（薄、仅限越界坐标、有界）
+
+- 模块常量 `_REPLAN_RESOLVE_INVALID_CODES = frozenset({"bad_coordinate", "bad_coordinate2"})`。
+- resolve-ALLOW 校验块：`invalid = validate_executable_action(adb, resolved)`；
+  `invalid in _REPLAN_RESOLVE_INVALID_CODES` → 走有界重规划（`reobserve_streak`/
+  `reobserves` 自增、`record["note"]="reobserve_required"`、`record["resolve_reason"]=invalid`、
+  `replan_feedback = _replan_feedback("resolve_invalid_action", invalid, resolved,
+  decision.semantic_target, extra={"coordinate_space": "0..1000 per axis"})`、
+  到 `max_reobserve` 以 `result="reobserve_required"` 终止，否则 `continue`）；
+  **其余任何码**保持原 `result="resolve_invalid_action"; break`（文本码仍 mirror）。
+- 该分支结构上位于 journal prepare/approve/verify/ADB **之前** → 非法轮次零设备、零 journal。
+- 新稳定 `source="resolve_invalid_action"`（区别于既有 `resolve`/`verify`/
+  `foreground_changed`/`legacy_xml_changed`）。
+- `_replan_feedback(..., *, extra=None)`：`extra` 为 dict 时仅合并尚不存在的字符串键，
+  绝不覆盖核心键（`source`/`reason`/`rejected_action`/`semantic_target`）。
+
+### 规范 — 实现 — 测试 映射表
+
+| 项 | 规范 | 实现（真实函数） | 测试 |
+|---|---|---|---|
+| K | `bad_coordinate`（click y 越界）→ 有界重规划；载荷含 `coordinate_space` 提示 | resolve-ALLOW 分支 `_replan_feedback("resolve_invalid_action", "bad_coordinate", resolved, semantic_target, extra=...)` | `test_bad_coordinate_resolve_routes_into_bounded_replan`（`tests/test_runner.py`） |
+| L | `bad_coordinate2`（swipe 终点越界）→ 同样重规划，`swipe_calls==1` 仅发生在后续合法轮 | 同上，`invalid=="bad_coordinate2"` | `test_bad_coordinate2_resolve_routes_into_bounded_replan` |
+| M | 持续越界仍受 `max_reobserve` 终止、零 tap | 共用 `if reobserve_streak >= max_reobserve: result="reobserve_required"; break` | `test_bad_coordinate_replan_is_bounded_by_max_reobserve`（`max_reobserve=3`→`reobserves==3`、`tap==0`） |
+| N | 一次性且不污染 history | 顶端消费后清空；`rejected_action` 永不入 history | `test_bad_coordinate_replan_is_one_shot_and_keeps_history_clean` |
+| O | 非坐标校验码（文本不被后端支持）仍 fail-closed，不重规划 | 其余码保持 `result="resolve_invalid_action"; break` | `test_text_unsupported_still_ends_not_replanned`（`type "中文"`→`resolve_invalid_action`、`replan_feedback is None`） |
+| J' | journal 边界：越界重规划零 journal 动作 | 分支在 `prepare` 之前 | `test_bad_coordinate_replan_creates_no_journal_record`（`tests/test_runner_journal.py`，`actions` 表为空、`tap==0`） |
+| R' | 既有越界测试随新语义改写（原 fails-closed → 现 bounded replan） | 同一分支 | `test_resolve_out_of_range_coordinate_routes_into_bounded_replan`（`tests/test_runner_observation.py`，重写自旧 `..._fails_closed`；`reobserves==3`、`tap_calls==0`、首记录 `resolve_reason=="bad_coordinate"`、`replan_feedback["coordinate_space"]=="0..1000 per axis"`） |
+
+> 旧 `test_resolve_out_of_range_coordinate_fails_closed` 在新实现下因第二次模型调用
+> 脚本耗尽报 `IndexError` —— 这正是「行为已按预期改变」的正向证据（非新 bug），
+> 据此重写为 `..._routes_into_bounded_replan`。
+
+### 文档同步
+
+- `docs/adding-a-pack.md`：「Bounded replan feedback (one-shot, generic)」条新增越界坐标
+  （`bad_coordinate`/`bad_coordinate2`，携 `coordinate_space` 提示）为第 5 个零副作用
+  重规划来源；明确 Core 绝不 clamp / scale / guess / 执行非法坐标；fail-closed 清单
+  改述为「除上述可重规划的越界坐标外的任何校验码，如 `text_unsupported_by_backend`」。
+- `docs/action-journal-design.md`：冻结未改。
+
+### 交付给用户（执行者/本地）
+
+1. 验证：`uv run --extra dev pytest -q`（`221 passed`）+ `git diff --check`。
+2. 暂存（**排除** Duolingo 运行产物与 lock）：
+   ```bash
+   git add mano/runner.py tests/test_runner.py tests/test_runner_journal.py \
+           tests/test_runner_observation.py docs/adding-a-pack.md docs/review-response-1020.md
+   git status --short   # 确认未混入 packs/duolingo/*, uv.lock 等
+   ```
+3. commit + push + `git rev-parse HEAD`（hash：`9acb4b57947aca1da4c6049029b687aabf8e8449`）。
+
+验收标准：全量 `221 passed`；越界坐标 → 有界重规划（0 ADB / 0 journal 动作）；非坐标
+校验码仍 fail-closed；`rejected_action` 不入 history；`max_reobserve` 仍能终止；
+`git diff --check` 无输出。
+
+> 落地：本轮已以 `9acb4b57947aca1da4c6049029b687aabf8e8449` push，tag **`v0.1.1`**
+> （不可移动，`v0.1.1^{commit}==9acb4b5`）。采购助手生产回执（2026-10-28）确认：
+> non-editable Git 安装、`direct_url.json` `requested_revision=v0.1.1` +
+> `commit_id=9acb4b5`、采购助手 commit `8692c47`、`286 passed`；真机：单 SKU 10/10
+> `COMPLETED_AUTONOMOUS`、串行双 SKU 各 10/10，且旧 `bad_coordinate` 任务以 v0.1.1
+> 重跑 → `COMPLETED`（29 journal `FINALIZED`，证明越界有界自纠正在真实页面生效）。
+
+---
+
+## 发布：v0.1.2（纯打包元数据，无运行代码改动）
+
+采购助手回执（2026-10-28）指出：v0.1.0 与 v0.1.1 构建出的 wheel 均为
+`mano-0.1.0-…`，因 `pyproject`/`__init__` 的 version 从未从 `0.1.0` 提升。本次只修
+版本元数据，不动任何运行代码。
+
+- 改动：`pyproject.toml` `version` 与 `mano/__init__.py` `__version__` 同步 `0.1.0 → 0.1.2`
+  （跳过 0.1.1 以避免移动已存在的 `v0.1.1` tag；该 tag 的 pyproject 仍写 0.1.0）。
+- 验证：`git diff --cached` 仅两行版本串；`uv run --extra dev pytest -q` → `221 passed`；
+  `uv build --wheel` → `mano-0.1.2-py3-none-any.whl`。
+- 发布 commit `02a19738f2847266b3e87c3fe9a24c1da0207667`（`9acb4b5..02a1973`，main），
+  tag **`v0.1.2`**（不可移动，`v0.1.2^{commit}==02a1973`）。
+- 复核未被动：`v0.1.1^{commit}==9acb4b5`、`v0.1.0^{commit}==47aaa09`。
+- 因纯元数据、运行代码零改动 → 采购助手仅需重装依赖 + 跑全量测试，**无需**重做
+  单 SKU / 批量真机验收。
