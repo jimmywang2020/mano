@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from mano.adb_executor import Adb, execute_action
 from mano.errors import ManoError, ManoNetworkError
 from mano.gui_plus_client import GuiPlus
 from mano.media import image_data_url, png_size
-from packs.duolingo import guards, matching_solver, prompts
+from packs.duolingo import guards, matching_solver, ordering_solver, prompts
 
 
 PACKAGE = "com.duolingo"
@@ -45,6 +46,21 @@ def _now_id() -> str:
 
 def _compact(action: dict) -> dict:
     return {key: action[key] for key in _HISTORY_KEYS if key in action}
+
+
+def _loop_sig(action: dict) -> tuple | None:
+    """Coarse grid signature over the normalized 0-1000 coordinate, used only to
+    catch A-B-A-B oscillation the exact-coordinate repeat guard misses (a word
+    tapped repeatedly drifts a few pixels, so exact signatures never match)."""
+    if action.get("action") != "click":
+        return None
+    coord = action.get("coordinate")
+    if not isinstance(coord, list) or len(coord) != 2:
+        return None
+    try:
+        return ("click", round(float(coord[0]) / 40), round(float(coord[1]) / 40))
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_local_tcp_serial(serial: str) -> bool:
@@ -198,6 +214,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     history: list[dict] = []
     last_sig: tuple | None = None
     repeat = 0
+    recent_loop: deque = deque(maxlen=6)
     wait_streak = 0
     result = "max_steps"
     step = 0
@@ -241,9 +258,21 @@ def cmd_run(args: argparse.Namespace) -> int:
             history.append({"action": "matching_solver", "status": solver_status})
             last_sig = None
             repeat = 0
+            recent_loop.clear()
             if solver_status in ("matching_stuck", "matching_no_cells"):
                 # solver 解析与真实界面不符,交回 VLM 尝试下一步
                 pass
+            time.sleep(SETTLE_S)
+            continue
+
+        # 能力路由:翻译组句题交确定性 solver(保证放全词再交检查,治「漏词早交」)
+        if ordering_solver.detect(xml):
+            solver_status = ordering_solver.solve(adb, client, log)
+            log({"step": step, "screenshot": shot.name, "router": "ordering_solver", "status": solver_status})
+            history.append({"action": "ordering_solver", "status": solver_status})
+            last_sig = None
+            repeat = 0
+            recent_loop.clear()
             time.sleep(SETTLE_S)
             continue
 
@@ -257,6 +286,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         sig = action_signature(action, width, height)
         blocked_repeat = sig is not None and sig == last_sig and (repeat + 1) >= 2
+        loop_sig = _loop_sig(action)
+        recent_loop.append(loop_sig)
+        # 严格 A-B-A-B 交替尾巴:末四步呈 X,Y,X,Y 且 X≠Y(免疫连续相同按钮如检查/继续误伤)
+        oscillating = (
+            loop_sig is not None
+            and len(recent_loop) >= 4
+            and recent_loop[-1] == recent_loop[-3]
+            and recent_loop[-2] == recent_loop[-4]
+            and recent_loop[-1] != recent_loop[-2]
+        )
 
         record = {
             "step": step,
@@ -268,6 +307,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "executed": False,
             "exec_error": None,
             "blocked_repeat": blocked_repeat,
+            "oscillating": oscillating,
             "human_verdict": None,
             "note": "",
         }
@@ -277,9 +317,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             log(record)
             result = f"terminate_{action.get('status')}"
             break
-        if blocked_repeat:
+        if blocked_repeat or oscillating:
+            if oscillating and not blocked_repeat:
+                record["note"] = "oscillation_loop"
             log(record)
-            result = "repeat_click_blocked"
+            result = "oscillation_blocked" if (oscillating and not blocked_repeat) else "repeat_click_blocked"
             break
 
         # 笼②半:连续空等守卫——奖励/过场屏上 VLM 反复 wait 不推进时拦下
