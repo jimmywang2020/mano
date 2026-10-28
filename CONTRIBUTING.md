@@ -40,9 +40,10 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-Both run the same suite. The current baseline is **221 passed** on the Core suite;
-adding tests (e.g. new doc tests) raises this count — update the expected number in
-the same change and in the handoff, do not leave it stale.
+Both commands run the same full suite. The current baseline is **225 passed**:
+221 Core tests plus 4 offline documentation-contract tests (`tests/test_docs.py`).
+Adding tests raises this count — update the expected number in the same change and
+in the handoff, do not leave it stale.
 
 ## Before you open a change
 
