@@ -8,4 +8,4 @@ guards, deterministic solvers) lives in ``packs/``, never in the engine.
 from .errors import ManoError, ManoNetworkError
 
 __all__ = ["ManoError", "ManoNetworkError"]
-__version__ = "0.1.0"
+__version__ = "0.1.2"
