@@ -33,7 +33,10 @@ Status vocabulary: `PLANNED` -> `IMPLEMENTED` -> `UNIT_TESTED` ->
     repo; this tracked file is the in-repo summary of record.
 - **Scope note:** This certifies the Mano backend. APK install and backend
   selection remain Consumer/deployment concerns. The consumer default sampling
-  backend stays `v01`; Mano runs behind a feature switch.
+  backend stays `v01`; Mano runs behind a feature switch. Acceptance covers **only
+  the recorded MuMu + Android + OpenATX AdbKeyboard APK combination**; a new device
+  type, Android version, or emulator build must re-run the Unicode acceptance
+  matrix before it may be treated as accepted.
 
 ### Why the previous readiness signal was rejected
 
@@ -44,10 +47,13 @@ receiver is ready, so the first broadcast still dropped (backend returned
 success in 277 ms, UI XML empty). The broadcast-receipt design replaces that
 proxy. Source:《mano调用反馈_1016.1326》.
 
-### Deprecated / removed
+### Deprecated (not removed)
 
 - Legacy `AdbKeyboardTextBackend` (F-Droid `com.android.adbkeyboard/.AdbIME`)
   exhibited "broadcast returns success but text never enters the field" on cold
-  start. It is scheduled for removal (direct delete — no git tag, still `0.1.0`,
-  never merged to `main`, no in-repo production caller). See the action-journal
-  rollout plan for sequencing.
+  start. It is **deprecated**, superseded by `OpenAtxAdbKeyboardBackend`, and has
+  no in-repo production caller. It is **still shipped as of v0.1.2** and is NOT
+  deleted in the current documentation round: removing it is a public-API /
+  packaging-compatibility change that must first assess external callers and ship
+  through its own versioned release + CHANGELOG entry, not a docs update. New
+  Consumers (especially Chinese text) MUST use `OpenAtxAdbKeyboardBackend`.

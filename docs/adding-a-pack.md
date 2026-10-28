@@ -6,15 +6,38 @@ A pack teaches mano how to complete a task in one specific app. The engine
 
 ## 1. Scaffold
 
+The current, recommended path is a `Pack` driven by the **thin runner**
+(`mano.runner.run`). A new pack implements the `Pack` protocol in `pack.py`; the
+device loop, approval gating, journaling and recovery all live in the Core — you
+do **not** copy a driver loop.
+
 ```
 packs/<your-app>/
   __init__.py
-  prompts.py   # system prompt + per-step instruction
-  guards.py    # deterministic stop/boundary detection
-  run.py       # driver loop (copy packs/duolingo/run.py and adapt)
+  pack.py      # implements the Pack protocol: system_prompt / instruction /
+               # guard / resolve / (optional) verify / (optional) on_action_executed
+  prompts.py   # system prompt + per-step instruction text
+  guards.py    # deterministic stop/boundary detection (optional helpers)
 ```
 
 Register the package in `pyproject.toml` under `[tool.setuptools].packages`.
+
+Wiring is the Consumer's job (construct `Adb`, pick a text backend, build the VLM
+client, call `runner.run(...)`). See [integration-guide.md](integration-guide.md)
+for a complete, offline-tested call, and
+[`packs/duolingo/run_via_runner.py`](../packs/duolingo/run_via_runner.py) for a
+reference wiring. That file is a **lifecycle reference**, not a full production
+template: it does not stand in for a Consumer's queue, device lease/fencing, a
+stable `run_id`, a durable journal, or recovery decisions.
+
+> **Legacy / A-B baseline.** [`packs/duolingo/run.py`](../packs/duolingo/run.py)
+> is an older **in-file driver loop** kept only as an A/B comparison baseline and
+> because it still carries deterministic solvers (matching / ordering) that have
+> **not** been migrated into the thin runner. It is **not** the recommended entry
+> for new packs. Do not copy its device-driving loop. When a solver is wired into
+> the thin runner later, it must return **at most one** candidate action per
+> observation and must never drive the device itself. `run_via_runner.py` and
+> `run.py` are therefore **not** claimed to be fully feature-equivalent today.
 
 ## 2. Prompts (`prompts.py`)
 
@@ -290,13 +313,67 @@ Backend failures carry a structured code plus `retryable` and
 ambiguous, so the run stops as `text_ambiguous_execution` and the input is
 **never replayed**. No text failure is auto-retried by the Core.
 
-> Device status: the **OpenATX** backend passed a real-device PoC (5/5 MuMu
-> cold starts, incl. `iPad Pro (2022) 11.0英寸`) but is **not yet certified in
-> this repo**; its `type_text` must still pass the full MuMu cold/hot-start
-> acceptance before any Consumer enables Chinese queries (`FakeAdb` tests alone
-> do not certify it). The **legacy** ADB-Keyboard backend is deprecated: it
-> reports available yet can silently drop a cold-start first injection. The APK
-> install/version is a Consumer/deployment concern, not the Pack's.
+> Device status: the **OpenATX** backend is `DEVICE_ACCEPTED` on the recorded
+> MuMu + OpenATX AdbKeyboard combination (MuMu cold start 10/10, hot start + exact
+> UI verification 60/60, original IME restored, fail-closed when the component is
+> absent) — see [device-acceptance.md](device-acceptance.md) for the authoritative
+> record. Acceptance covers only that device/APK combination; a new device type,
+> Android version, or emulator build must re-run the Unicode acceptance matrix
+> (`FakeAdb` tests alone never certify a backend). The **legacy** ADB-Keyboard
+> backend is deprecated: it reports available yet can silently drop a cold-start
+> first injection. The APK install/version is a Consumer/deployment concern, not
+> the Pack's.
+
+### Three success facts & post-input page verification (Pack contract)
+
+These three names are **spec concepts for reasoning**, NOT existing API constants
+— there is no `RunResult` field, enum, or status with these names. Do not write
+`result.status == "APP_VALUE_VERIFIED"`; it does not exist. They name three facts
+that must be kept separate:
+
+- **TRANSPORT_ACCEPTED** — the text backend's transport receipt was accepted
+  (e.g. OpenATX broadcast `result=-1`). The bytes left Mano for the device.
+- **ACTION_EXECUTED** — the Core completed one `type` action's execution flow
+  (ADB dispatch returned, the action was counted, and — with a journal — moved to
+  `EXECUTED`/`FINALIZED`).
+- **APP_VALUE_VERIFIED** — the Pack, reading the **latest** App page, confirmed
+  the actual value in the target field matches the canonical text.
+
+An earlier fact does **not** prove a later one. A successful transport receipt
+does not prove the field holds the value; `on_action_executed` only means "Core
+called the backend", never "the App field is correct forever".
+
+Contract for a text-entering Pack:
+
+- **Re-read and verify after input.** On the next observation, confirm from App
+  page facts that the field's actual text equals your canonical text. Do not
+  conclude APP_VALUE_VERIFIED from a transport receipt alone. When the XML cannot
+  confirm the value, you may combine a screenshot / VLM read — but a transport
+  success still never substitutes for reading the App value.
+- **Search-submit preconditions.** Before emitting a search submit, confirm the
+  current page, the input field's actual value, and the submit control all belong
+  to the **same** search context (do not submit against a stale page or a field
+  you have not re-verified).
+- **Normalization is whitelisted.** The Core never normalizes, truncates, or
+  rewrites text (`action_codec.validate_action` rejects, it does not edit). Any
+  comparison normalization the Pack applies must be an explicit, documented
+  whitelist (e.g. Unicode NFC, trim surrounding whitespace); never silently drop
+  characters, change width/case, or "fix" the value to force a match.
+- **Pack never picks the transport.** A Pack emits `{"action":"type","text":...}`
+  and never selects an IME/backend, installs an APK, or calls ADB directly; the
+  model does not pick a backend either. The Consumer chooses the text backend when
+  it constructs `Adb`, and the Core never silently downgrades OpenATX → ASCII (out
+  of charset → fail closed, zero device change).
+- **`unicode_required` is a Consumer config example, not a Mano parameter.**
+  `runner.run()` has no `unicode_required` argument. A Consumer may gate "only
+  start once a Unicode-capable backend passed preflight" in its own config; that
+  is not a field the Core accepts.
+- **`type` under a journal.** A device-modifying `type` goes through the same
+  `prepare → DISPATCHING → execute → EXECUTED → hook → FINALIZED` window; an
+  ambiguous text failure (`action_may_have_executed=True`, e.g.
+  `text_backend_restore_failed`) is classified `OUTCOME_UNKNOWN` and is **never**
+  auto-replayed. The text's hash/length and evidence refs are journaled, not the
+  raw text.
 
 ### Stable semantic identity (Pack contract)
 

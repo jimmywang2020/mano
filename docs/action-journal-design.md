@@ -1,5 +1,12 @@
 # P0 Action Journal — Design (Round 1d: approved for Round-2)
 
+> **Implemented in v0.1.x.** This design is now realized in code
+> (`mano/action_journal.py` + the runner wiring). Third-party integrators should
+> start from [integration-guide.md](integration-guide.md) (how to wire a journal,
+> a stable `run_id`, and `recovery_decide`); this document is kept as the deep
+> protocol / failure-window reference, not a getting-started guide. The frozen
+> protocol body below is unchanged.
+
 > **Status: DESIGN APPROVED (round 1d). Round-2 implementation authorized.**
 > This document is the P0 design deliverable. Round-2 (SQLite reference +
 > Runner wiring + failure matrix) is approved per《mano开发设计评审_1019_1520》;
