@@ -11,6 +11,25 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## v0.1.3 — 2026-11-17 — on-demand capture modes
+
+- **Feature.** `capture_observation(..., mode=)` accepts `"full"` (default),
+  `"tree"` (foreground + XML, no screenshot), and `"shot"` (foreground +
+  screenshot, no XML). Consumers such as mau can gate on the accessibility tree
+  before paying for a PNG. Optional `fallback_size` supplies `width`/`height`
+  when `mode="tree"`.
+- **Observability.** `Observation` gains `capture_mode` plus derived
+  `screenshot_ms` / `xml_ms` / `screenshot_skipped` / `xml_skipped`; `to_log()`
+  includes these fields so adapters can break down observe cost without
+  re-deriving timestamps.
+- **Compatibility.** Runner and packs keep default `mode="full"`; existing call
+  sites are unchanged. Empty `screenshot` / `xml_path` strings mean that modality
+  was skipped for the chosen mode.
+- **Tests.** `tests/test_observation_modes.py` covers mode branches and breakdown
+  fields.
+- **Migration:** bump the pin to `v0.1.3` and opt into `mode="tree"` /
+  `mode="shot"` where needed; no change required for callers that omit `mode`.
+
 ## v0.1.2 — 2026-10-28 — packaging metadata only
 
 - **Packaging fix (no runtime change).** Bumped the package version in

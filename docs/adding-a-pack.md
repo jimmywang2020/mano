@@ -120,23 +120,29 @@ The loop separates three responsibilities on purpose:
 
 ### Observation is bounded, not atomic
 
-`capture_observation()` (`mano/observation.py`) takes one screenshot + **one** XML
-dump + two foreground reads, in the order
+`capture_observation()` (`mano/observation.py`) defaults to `mode="full"`: one
+screenshot + **one** XML dump + two foreground reads, in the order
 `foreground_before → screenshot → XML → foreground_after`, and marks the bundle
-*stable* iff the screenshot and XML both succeeded, `foreground_before ==
-foreground_after`, and `skew_ms <= max_skew_ms`. The `skew_ms` *duration* is
-measured with the **monotonic** clock (`time.monotonic_ns`), not wall time, so a
-system-clock step/rollback (NTP, DST) cannot forge a negative or huge span; the
-epoch timestamps are still recorded as evidence only. It is deliberately **NOT** an
-atomic snapshot: the screenshot and the XML can still describe slightly different
-instants, and the Core does **not** try to detect cross-modal contradictions
-(e.g. XML says "result" while the PNG still shows a spinner). The raw XML
-fingerprint is recorded as **evidence only** — it does **not** gate stability, so
-a page with a legitimately animating/churning XML (carousels, timers) is not
-falsely reported unstable. Deciding whether a page is "ready enough" is the
-model's and the Pack's job, not the Core's. External consumers should call
+*stable* iff the required modalities succeeded, `foreground_before ==
+foreground_after`, and `skew_ms <= max_skew_ms`. Partial modes skip a modality so
+adapters can gate cheaply: `mode="tree"` skips the screenshot; `mode="shot"`
+skips the XML dump. Pass `fallback_size=(w,h)` when using `mode="tree"` if the
+caller still needs dimensions. The `skew_ms` *duration* is measured with the
+**monotonic** clock (`time.monotonic_ns`), not wall time, so a system-clock
+step/rollback (NTP, DST) cannot forge a negative or huge span; the epoch
+timestamps are still recorded as evidence only (`to_log()` also surfaces
+`screenshot_ms` / `xml_ms`). It is deliberately **NOT** an atomic snapshot: the
+screenshot and the XML can still describe slightly different instants, and the
+Core does **not** try to detect cross-modal contradictions (e.g. XML says
+"result" while the PNG still shows a spinner). The raw XML fingerprint is
+recorded as **evidence only** — it does **not** gate stability, so a page with a
+legitimately animating/churning XML (carousels, timers) is not falsely reported
+unstable. Deciding whether a page is "ready enough" is the model's and the
+Pack's job, not the Core's. External consumers should call
 `capture_observation()` + `propose_action()` instead of rolling their own
-screenshot/ui_dump/VLM code, so these boundaries apply uniformly.
+screenshot/ui_dump/VLM code, so these boundaries apply uniformly. The runner
+keeps `mode="full"`; tree/shot are for adapters that implement Hybrid-style
+gating.
 
 ### The per-step order
 

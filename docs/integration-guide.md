@@ -6,7 +6,7 @@ Consumer's view; writing a Pack is covered in
 [adding-a-pack.md](adding-a-pack.md).
 
 > **0.x compatibility.** The import paths and call shapes below are the
-> **v0.1.2-verified integration surface**, not a frozen ABI. `mano` is still 0.x;
+> **v0.1.3-verified integration surface**, not a frozen ABI. `mano` is still 0.x;
 > later changes ship through a new tag + a [CHANGELOG.md](../CHANGELOG.md) entry +
 > migration notes. Pin to an immovable tag.
 
@@ -15,17 +15,17 @@ Consumer's view; writing a Pack is covered in
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install 'mano @ git+https://github.com/jimmywang2020/mano.git@v0.1.2'
+python -m pip install 'mano @ git+https://github.com/jimmywang2020/mano.git@v0.1.3'
 
-python -c "import importlib.metadata as m; print(m.version('mano'))"   # 0.1.2
+python -c "import importlib.metadata as m; print(m.version('mano'))"   # 0.1.3
 ```
 
 `mano` has **no third-party runtime dependencies** (standard library only). `uv`
 is optional. For a Git (non-editable) install, `direct_url.json` records
-`requested_revision == v0.1.2` and a pinned `commit_id`; confirm those match the
+`requested_revision == v0.1.3` and a pinned `commit_id`; confirm those match the
 tag you intended.
 
-## 2. Verified import paths (v0.1.2)
+## 2. Verified import paths (v0.1.3)
 
 ```python
 from mano.adb_executor import Adb

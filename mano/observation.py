@@ -9,18 +9,24 @@ same instant, and it does not try to detect cross-modal content contradictions
 (that would need visual semantics in the Core, which is out of scope). Deciding
 whether a page is "ready" is the model's / Pack's job, not the Core's.
 
-Generic validity carries no app semantics. Capture order per attempt:
+Generic validity carries no app semantics. Capture order per attempt for
+``mode="full"`` (default):
 
     foreground_before -> screenshot -> XML -> foreground_after
 
+Partial modes skip one modality so consumers (e.g. mau) can gate on the tree
+before paying for a screenshot:
+
+- ``tree``: ``foreground_before -> XML -> foreground_after`` (no screenshot)
+- ``shot``: ``foreground_before -> screenshot -> foreground_after`` (no XML)
+
 An observation is usable only when:
-  * the screenshot succeeded;
-  * the XML dump succeeded;
+  * every modality required by ``mode`` succeeded;
   * the foreground package did not change across the window
     (``foreground_before == foreground_after``); and
   * the whole capture span (``skew_ms``) stayed under a configurable ceiling.
-    On MuMu the real idle span is ~4.3-4.8s, so the default is 6000ms; 4000ms
-    deterministically false-kills. Tune per platform.
+    On MuMu the real idle span for full capture is ~4.3-4.8s, so the default is
+    6000ms; 4000ms deterministically false-kills. Tune per platform.
 
 The raw XML fingerprint is recorded as diagnostic evidence but does **not**
 gate generic stability: unrelated dynamic nodes (carousels, timers) change the
@@ -36,9 +42,13 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 # Measured idle screenshot+dump span on MuMu is ~4.3-4.8s; 6000ms clears it, 4000ms does not.
 DEFAULT_MAX_SKEW_MS = 6000
+
+CaptureMode = Literal["full", "tree", "shot"]
+CAPTURE_MODES = frozenset({"full", "tree", "shot"})
 
 
 def _now_ms() -> int:
@@ -61,14 +71,20 @@ def xml_fingerprint(xml: str) -> str:
     return hashlib.sha256(xml.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _duration_ms(started_at: int, finished_at: int) -> int:
+    if started_at <= 0 or finished_at <= 0:
+        return 0
+    return max(0, int(finished_at) - int(started_at))
+
+
 @dataclass
 class Observation:
     """One bounded view of the device at a point in the run (not an atomic snapshot)."""
 
     observation_id: str
     step: int
-    screenshot: str  # file name of the PNG inside run_dir
-    xml_path: str  # file name of the XML inside run_dir
+    screenshot: str  # file name of the PNG inside run_dir; "" when mode=tree
+    xml_path: str  # file name of the XML inside run_dir; "" when mode=shot
     width: int
     height: int
     foreground: str  # authoritative value (== foreground_after)
@@ -87,6 +103,23 @@ class Observation:
     skew_ms: int
     capture_attempt: int
     stability: str  # "stable" | "unstable"
+    capture_mode: CaptureMode = "full"
+
+    @property
+    def screenshot_ms(self) -> int:
+        return _duration_ms(self.screenshot_started_at, self.screenshot_finished_at)
+
+    @property
+    def xml_ms(self) -> int:
+        return _duration_ms(self.xml_started_at, self.xml_finished_at)
+
+    @property
+    def screenshot_skipped(self) -> bool:
+        return self.capture_mode == "tree"
+
+    @property
+    def xml_skipped(self) -> bool:
+        return self.capture_mode == "shot"
 
     def to_log(self) -> dict:
         """Loggable view: references + timing + the inputs to the stable verdict,
@@ -110,6 +143,11 @@ class Observation:
             "skew_ms": self.skew_ms,
             "capture_attempt": self.capture_attempt,
             "stability": self.stability,
+            "capture_mode": self.capture_mode,
+            "screenshot_ms": self.screenshot_ms,
+            "xml_ms": self.xml_ms,
+            "screenshot_skipped": self.screenshot_skipped,
+            "xml_skipped": self.xml_skipped,
         }
 
 
@@ -172,23 +210,40 @@ def capture_observation(
     max_attempts: int = 3,
     settle_s: float = 0.4,
     max_skew_ms: int = DEFAULT_MAX_SKEW_MS,
+    mode: CaptureMode = "full",
+    fallback_size: tuple[int, int] | None = None,
 ) -> Observation:
     """Capture a bounded observation with a generic validity check.
 
     ``capture_frame(adb, path) -> (width, height)`` is injected (the runner passes
     its screenshot-with-reconnect helper) so this module stays free of ADB retry
-    policy. Order per attempt: ``foreground_before -> screenshot -> XML (single
-    dump) -> foreground_after``. The attempt is usable when the foreground is
-    unchanged across the window and the span stays within ``max_skew_ms``; the raw
+    policy. Default ``mode="full"`` order per attempt:
+    ``foreground_before -> screenshot -> XML (single dump) -> foreground_after``.
+
+    ``mode="tree"`` skips the screenshot (Hybrid / a11y-first gating).
+    ``mode="shot"`` skips the XML dump (visual-only upgrade after a tree gate).
+
+    The attempt is usable when the required modalities succeed, the foreground is
+    unchanged across the window, and the span stays within ``max_skew_ms``. The raw
     XML fingerprint is recorded but does not gate stability. After ``max_attempts``
     the latest (possibly unstable) view is returned with ``stability == "unstable"``;
     the caller must not drive the model or execute a device action on it.
+
+    ``fallback_size`` supplies ``width``/``height`` when ``mode="tree"`` (no frame).
     """
+    if mode not in CAPTURE_MODES:
+        raise ValueError(f"unsupported capture mode: {mode!r}")
+
     run_dir = Path(run_dir)
-    shot = run_dir / f"step-{step:02d}.png"
-    xml_path = run_dir / f"step-{step:02d}.xml"
+    want_shot = mode in {"full", "shot"}
+    want_xml = mode in {"full", "tree"}
+    shot = run_dir / f"step-{step:02d}.png" if want_shot else None
+    xml_path = run_dir / f"step-{step:02d}.xml" if want_xml else None
 
     width = height = 0
+    if not want_shot and fallback_size is not None:
+        width, height = int(fallback_size[0]), int(fallback_size[1])
+
     xml = ""
     fp = ""
     fg_before = fg_after = ""
@@ -206,21 +261,34 @@ def capture_observation(
         fg_before = adb.foreground_package()
         fg_before_at = _now_ms()
 
-        screenshot_started_at = _now_ms()
-        width, height = capture_frame(adb, shot)
-        screenshot_finished_at = _now_ms()
+        if want_shot:
+            assert shot is not None
+            screenshot_started_at = _now_ms()
+            width, height = capture_frame(adb, shot)
+            screenshot_finished_at = _now_ms()
+        else:
+            screenshot_started_at = screenshot_finished_at = 0
 
-        xml_started_at = _now_ms()
-        xml = adb.ui_dump().decode("utf-8", errors="replace")
-        xml_finished_at = _now_ms()
+        if want_xml:
+            xml_started_at = _now_ms()
+            xml = adb.ui_dump().decode("utf-8", errors="replace")
+            xml_finished_at = _now_ms()
+        else:
+            xml = ""
+            xml_started_at = xml_finished_at = 0
 
         fg_after = adb.foreground_package()
         fg_after_at = _now_ms()
         capture_finished_at = fg_after_at
 
-        fp = xml_fingerprint(xml)
+        fp = xml_fingerprint(xml) if want_xml else ""
         skew_ms = _mono_ms() - mono_started  # duration via monotonic, not wall-clock
-        valid = fg_before == fg_after and skew_ms <= max_skew_ms
+        modalities_ok = True
+        if want_shot and (width <= 0 or height <= 0):
+            modalities_ok = False
+        if want_xml and not xml:
+            modalities_ok = False
+        valid = modalities_ok and fg_before == fg_after and skew_ms <= max_skew_ms
         if valid:
             stability = "stable"
             break
@@ -228,12 +296,13 @@ def capture_observation(
         if attempt < max_attempts:
             time.sleep(settle_s)
 
-    xml_path.write_text(xml, encoding="utf-8")
+    if xml_path is not None:
+        xml_path.write_text(xml, encoding="utf-8")
     return Observation(
         observation_id=_new_id(),
         step=step,
-        screenshot=shot.name,
-        xml_path=xml_path.name,
+        screenshot=shot.name if shot is not None else "",
+        xml_path=xml_path.name if xml_path is not None else "",
         width=width,
         height=height,
         foreground=fg_after,
@@ -252,6 +321,7 @@ def capture_observation(
         skew_ms=skew_ms,
         capture_attempt=attempt,
         stability=stability,
+        capture_mode=mode,
     )
 
 
