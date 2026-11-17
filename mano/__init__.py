@@ -5,7 +5,7 @@ it through a small, whitelisted ADB surface. App-specific knowledge (prompts,
 guards, deterministic solvers) lives in ``packs/``, never in the engine.
 """
 
-from .errors import ManoError, ManoNetworkError
+from .errors import ManoDeviceError, ManoError, ManoNetworkError
 
-__all__ = ["ManoError", "ManoNetworkError"]
-__version__ = "0.1.3"
+__all__ = ["ManoDeviceError", "ManoError", "ManoNetworkError"]
+__version__ = "0.1.4"

@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from shutil import which
 
-from .errors import ManoError
+from .errors import ManoDeviceError, ManoError
 from .action_codec import KEYEVENT_CODES, int_coord, validate_action
 from .media import png_size
 from .text_input import AsciiAdbTextBackend, TextInputBackend, TextInputError
@@ -71,6 +71,18 @@ class Adb:
         self.shell("monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1")
         time.sleep(3)
 
+    def warm_start(self, package: str) -> None:
+        """Bring ``package`` to the foreground without force-stop."""
+        self.shell(
+            "monkey",
+            "-p",
+            package,
+            "-c",
+            "android.intent.category.LAUNCHER",
+            "1",
+        )
+        time.sleep(1.5)
+
     def tap(self, x: int, y: int) -> None:
         self.shell("input", "tap", str(x), str(y))
 
@@ -94,18 +106,45 @@ class Adb:
         self.shell("input", "keyevent", key)
 
     def ui_dump(self) -> bytes:
+        """Dump the accessibility tree; prefer ``--compressed``, fall back plain.
+
+        Raises ``ManoDeviceError`` with a stable ``code`` instead of a bare
+        ``CalledProcessError`` so adapters can degrade or fail fast.
+        """
         remote = "/sdcard/mano-window.xml"
-        last_error: subprocess.CalledProcessError | None = None
-        for attempt in range(2):
-            try:
-                self.shell("uiautomator", "dump", remote)
-                return self.run("exec-out", "cat", remote).stdout
-            except subprocess.CalledProcessError as exc:
-                last_error = exc
-                if attempt == 0:
+        strategies: list[tuple[str, tuple[str, ...]]] = [
+            ("compressed", ("uiautomator", "dump", "--compressed", remote)),
+            ("plain", ("uiautomator", "dump", remote)),
+        ]
+        last_error: BaseException | None = None
+        last_returncode: int | None = None
+        for name, args in strategies:
+            for attempt in range(2):
+                try:
+                    self.shell(*args)
+                    raw = self.run("exec-out", "cat", remote).stdout
+                    if not raw or not raw.strip():
+                        raise ManoDeviceError(
+                            f"ui_dump empty after {name}",
+                            code="UI_DUMP_EMPTY",
+                        )
+                    return raw
+                except ManoDeviceError:
+                    raise
+                except subprocess.CalledProcessError as exc:
+                    last_error = exc
+                    last_returncode = int(exc.returncode) if exc.returncode is not None else None
                     time.sleep(0.5)
-        assert last_error is not None
-        raise last_error
+                except OSError as exc:
+                    last_error = exc
+                    time.sleep(0.5)
+        code = "UI_DUMP_FAILED"
+        if last_returncode in {137, 143, 9}:
+            code = "UI_DUMP_KILLED"
+        raise ManoDeviceError(
+            f"ui_dump failed after compressed+plain retries: {last_error}",
+            code=code,
+        ) from last_error
 
     def foreground_package(self) -> str:
         """Return the current foreground app's package name, or '' if unknown."""

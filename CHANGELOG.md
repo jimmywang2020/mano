@@ -11,6 +11,20 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## v0.1.4 — 2026-11-17 — compressed dump + warm_start
+
+- **Feature.** `Adb.ui_dump` prefers `uiautomator dump --compressed`, then falls
+  back to plain dump (2 attempts each). Failures raise `ManoDeviceError` with
+  stable codes (`UI_DUMP_FAILED` / `UI_DUMP_EMPTY` / `UI_DUMP_KILLED` for exit
+  137/143/9) instead of a bare `CalledProcessError`.
+- **Feature.** `Adb.warm_start(package)` launches via monkey without `force-stop`
+  (complements `cold_start`). Adapters such as mau can call this for warm ensure.
+- **Errors.** `ManoError` gains optional `code=`; new `ManoDeviceError` subclass.
+- **Tests.** `tests/test_adb_ui_dump.py` covers compressed-first success, plain
+  fallback, empty dump, and killed exit codes.
+- **Migration:** bump the pin to `v0.1.4`. Catch `ManoDeviceError` / `exc.code`
+  when degrading dump → screenshot-only observe.
+
 ## v0.1.3 — 2026-11-17 — on-demand capture modes
 
 - **Feature.** `capture_observation(..., mode=)` accepts `"full"` (default),
