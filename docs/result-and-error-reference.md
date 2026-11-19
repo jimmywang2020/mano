@@ -6,10 +6,11 @@ facts, some come from a text backend, and some are **Pack/guard-defined** string
 that Mano passes through verbatim. This doc records each namespace separately so a
 Consumer handles them correctly.
 
-> Verified against `v0.1.2`. `RunResult` carries only the fields listed in
-> [integration-guide.md](integration-guide.md) §8 — do not depend on fields not
-> listed there. **Never infer "the action did not execute" from a result string
-> alone**; the ambiguous facts below exist because that inference is unsafe.
+> Verified against `v0.1.4` (see [CHANGELOG.md](../CHANGELOG.md)). `RunResult`
+> carries only the fields listed in [integration-guide.md](integration-guide.md)
+> §8 — do not depend on fields not listed there. **Never infer "the action did
+> not execute" from a result string alone**; the ambiguous facts below exist
+> because that inference is unsafe.
 
 Columns: **Source** (who produces it), **Stability** (fixed Core constant vs Pack
 extension), **Side-effect** (could a device change have happened), **Retryable**
@@ -102,6 +103,19 @@ decisions. The Core never reads them as a business state.
   `ALREADY_APPLIED`/`NOT_APPLIED` verdict from a compatible Pack.
 
 See [action-journal-design.md](action-journal-design.md) for the full lattice.
+
+## 4.1 Device / dump errors (`ManoDeviceError`, v0.1.4+)
+
+Raised from ADB/device helpers (not `RunResult.result` strings). Prefer catching
+`ManoDeviceError` and reading **`exc.code`**:
+
+| `code` | Meaning / handling |
+|---|---|
+| `UI_DUMP_FAILED` | Dump command failed after compressed + plain attempts. |
+| `UI_DUMP_EMPTY` | Dump produced empty hierarchy. |
+| `UI_DUMP_KILLED` | Dump process killed (exit 137/143/9). Retry or degrade to screenshot-only. |
+
+`ManoError` may carry optional `code=` on other paths; see CHANGELOG `v0.1.4`.
 
 ## 5. Pack verdicts (`resolve` / `verify`)
 

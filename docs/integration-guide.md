@@ -6,26 +6,27 @@ Consumer's view; writing a Pack is covered in
 [adding-a-pack.md](adding-a-pack.md).
 
 > **0.x compatibility.** The import paths and call shapes below are the
-> **v0.1.3-verified integration surface**, not a frozen ABI. `mano` is still 0.x;
+> **v0.1.4-verified integration surface**, not a frozen ABI. `mano` is still 0.x;
 > later changes ship through a new tag + a [CHANGELOG.md](../CHANGELOG.md) entry +
-> migration notes. Pin to an immovable tag.
+> migration notes. Pin to an immovable tag. Prefer reading CHANGELOG when a
+> paragraph still mentions an older tag historically.
 
 ## 1. Install and verify
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install 'mano @ git+https://github.com/jimmywang2020/mano.git@v0.1.3'
+python -m pip install 'mano @ git+https://github.com/jimmywang2020/mano.git@v0.1.4'
 
-python -c "import importlib.metadata as m; print(m.version('mano'))"   # 0.1.3
+python -c "import importlib.metadata as m; print(m.version('mano'))"   # 0.1.4
 ```
 
 `mano` has **no third-party runtime dependencies** (standard library only). `uv`
 is optional. For a Git (non-editable) install, `direct_url.json` records
-`requested_revision == v0.1.3` and a pinned `commit_id`; confirm those match the
+`requested_revision == v0.1.4` and a pinned `commit_id`; confirm those match the
 tag you intended.
 
-## 2. Verified import paths (v0.1.3)
+## 2. Verified import paths (v0.1.4)
 
 ```python
 from mano.adb_executor import Adb
@@ -224,7 +225,22 @@ A text-backend failure is classified with `retryable` and the two review flags
 into the **per-step `steps.jsonl` record** (and the journal), not yet projected as
 structured fields on `RunResult`. If your handling needs the flags, read them from
 the step log / journal. (A structured `RunResult` projection is a possible later,
-tagged change — not available in v0.1.2.)
+tagged change — not available in early 0.1.x; still read step log / journal.)
+
+## 9.1 Observation modes + warm start (v0.1.3 / v0.1.4)
+
+- **`capture_observation(..., mode=)`** (`v0.1.3`): `"full"` (default), `"tree"`
+  (foreground + XML, no PNG), `"shot"` (foreground + screenshot, no XML).
+  `Observation` exposes `capture_mode`, `screenshot_ms` / `xml_ms`, and skip
+  flags for adapter cost breakdowns (e.g. mau).
+- **`Adb.ui_dump`** (`v0.1.4`): prefers `uiautomator dump --compressed`, then
+  plain dump; failures raise **`ManoDeviceError`** with stable `code`
+  (`UI_DUMP_FAILED` / `UI_DUMP_EMPTY` / `UI_DUMP_KILLED`).
+- **`Adb.warm_start(package)`** (`v0.1.4`): launch via monkey **without**
+  `force-stop` (complements `cold_start`). Host/MCP adapters use this for warm
+  ensure when the app is already installed.
+
+See [CHANGELOG.md](../CHANGELOG.md) `v0.1.3` / `v0.1.4` for migration notes.
 
 ## 10. Experiment vs. production wiring
 
@@ -248,7 +264,7 @@ personal data**. The journal stores evidence **refs** plus a text hash/length, n
 raw text. Treat the whole `run_dir` as sensitive: keep it out of version control
 (it is git-ignored in this repo) and apply your own retention / deletion policy.
 
-## 12. Current limitations (v0.1.2)
+## 12. Current limitations (v0.1.4)
 
 - The `Pack` protocol is a **0.x experimental interface**, not a frozen ABI.
 - `RunResult` does **not** fully project the text-backend structured termination
@@ -258,3 +274,6 @@ raw text. Treat the whole `run_dir` as sensitive: keep it out of version control
 - OpenATX Unicode input is `DEVICE_ACCEPTED` only on the **recorded** device
   combination; a new device/Android/emulator must re-run its acceptance matrix.
 - `journal=None` provides **no** crash blurry-window protection.
+- Host-facing MCP orchestration (goals, resume, recipe gates) lives in the
+  separate Consumer [mano-android-use](https://github.com/jimmywang2020/mano-android-use),
+  not in Core.

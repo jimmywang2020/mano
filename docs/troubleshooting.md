@@ -1,7 +1,7 @@
 # Troubleshooting
 
-Symptom-first diagnosis. Verified against `v0.1.2`. The result/error codes
-referenced here are defined in
+Symptom-first diagnosis. Verified against `v0.1.4` (pin + CHANGELOG). The
+result/error codes referenced here are defined in
 [result-and-error-reference.md](result-and-error-reference.md).
 
 > Never "fix" a run by: silently switching the text backend, guessing/clamping a
@@ -21,6 +21,16 @@ fail.
   still fails, reconnect manually: `adb connect 127.0.0.1:16384`.
 - Ensure `adb` is on `PATH` or `MANO_ADB_PATH` points at an executable adb.
 - MuMu: the bundled adb is used only as a fallback when no system adb is found.
+
+## UI dump fails / empty hierarchy (`ManoDeviceError`, v0.1.4+)
+
+**Symptom:** observation cannot get XML; exception is `ManoDeviceError` with
+`code` in `UI_DUMP_FAILED` / `UI_DUMP_EMPTY` / `UI_DUMP_KILLED` (exits 137/143/9).
+
+- Retry once after the UI settles; compressed dump is preferred, then plain dump.
+- Catch `ManoDeviceError` and degrade to screenshot-only observe if your Consumer
+  supports it (see CHANGELOG `v0.1.4`).
+- Do not treat a bare `CalledProcessError` as the stable contract anymore.
 
 ## Text backend / IME not ready
 

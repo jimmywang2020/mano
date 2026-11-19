@@ -8,14 +8,17 @@ mano looks at the screen with a hosted GUI vision-language model (VLM), proposes
 action surface (tap / swipe / text / a few keyevents). App-specific knowledge —
 prompts, guards, deterministic solvers — lives in `packs/`, never in the engine.
 
-> **Status (v0.1.2).** The core engine — thin runner, Pack `resolve`/`verify`,
+> **Status (v0.1.4).** The core engine — thin runner, Pack `resolve`/`verify`,
 > durable action journal + crash recovery, pluggable text backends, bounded
-> re-plan feedback — is implemented and has completed Consumer production
-> acceptance on a **recorded** MuMu + OpenATX AdbKeyboard combination (see
+> re-plan feedback, on-demand observation modes (`full` / `tree` / `shot`),
+> compressed UI dump + `Adb.warm_start`, and `ManoDeviceError` codes — is
+> implemented. Consumer production acceptance was recorded on a **MuMu +
+> OpenATX AdbKeyboard** combination (see
 > [docs/device-acceptance.md](docs/device-acceptance.md)). This does **not** mean
 > every Android device/emulator is certified, nor that the 0.x API is frozen:
 > interfaces may still change, and new device combinations must re-run their own
-> acceptance. Treat `mano` as a 0.x dependency pinned to an immovable tag.
+> acceptance. Treat `mano` as a 0.x dependency pinned to an **immovable tag**
+> (current recommended pin: **`v0.1.4`**; see [CHANGELOG.md](CHANGELOG.md)).
 
 ## Demo
 
@@ -56,24 +59,24 @@ plain virtual environment is enough. Install from an **immovable release tag**
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install 'mano @ git+https://github.com/jimmywang2020/mano.git@v0.1.2'
+python -m pip install 'mano @ git+https://github.com/jimmywang2020/mano.git@v0.1.4'
 ```
 
-`uv` is optional — if you use it, `uv pip install 'mano @ git+...@v0.1.2'` works
+`uv` is optional — if you use it, `uv pip install 'mano @ git+...@v0.1.4'` works
 too — but nothing here assumes `uv` is on the machine.
 
 Verify the exact artifact you installed (version, tag, commit, non-editable):
 
 ```bash
-python -c "import importlib.metadata as m; print(m.version('mano'))"   # 0.1.2
+python -c "import importlib.metadata as m; print(m.version('mano'))"   # 0.1.4
 python - <<'PY'
 import importlib.metadata as m
 d = m.Distribution.from_name("mano")
-print(d.read_text("direct_url.json"))   # requested_revision == v0.1.2, commit_id pinned
+print(d.read_text("direct_url.json"))   # requested_revision == v0.1.4, commit_id pinned
 PY
 ```
 
-A correct install shows `requested_revision` `v0.1.2`, a pinned `commit_id`, and
+A correct install shows `requested_revision` `v0.1.4`, a pinned `commit_id`, and
 `"editable": false` (or no `dir_info.editable`).
 
 ## Requirements
@@ -172,9 +175,13 @@ packs/
 
 ## Documentation
 
+Pin and migration notes always follow the **latest tag** in
+[CHANGELOG.md](CHANGELOG.md). Older docs may still mention a prior verified
+surface; bump the pin when integrating.
+
 | Doc | Audience / purpose |
 |---|---|
-| [docs/integration-guide.md](docs/integration-guide.md) | **Third-party integrators** — install, construct `Adb`/backend/Pack/client, call `runner.run()`, journal, `run_id`, recovery, `RunResult`. |
+| [docs/integration-guide.md](docs/integration-guide.md) | **Third-party integrators** — install, construct `Adb`/backend/Pack/client, call `runner.run()`, journal, `run_id`, recovery, `RunResult`, capture modes / `warm_start`. |
 | [docs/adding-a-pack.md](docs/adding-a-pack.md) | **Pack authors** — the `resolve`/`verify` contract, stable semantic identity, text input, guards. |
 | [docs/result-and-error-reference.md](docs/result-and-error-reference.md) | Result codes & error namespaces: meaning, side-effect risk, retryability, review, handling. |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom-first diagnosis (ADB, IME/backend, VLM parse, REOBSERVE, BLOCK, journal, recovery). |
@@ -184,6 +191,13 @@ packs/
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Dev environment, tests, Core/Pack/Consumer boundary, release flow. |
 | [docs/harness-rules.md](docs/harness-rules.md) | **Maintainer-internal** harness rules (not an integration guide). |
 | [docs/review-response-1020.md](docs/review-response-1020.md) | **Historical** review responses (not a current usage guide). |
+
+## Related consumers
+
+- **[mano-android-use (mau)](https://github.com/jimmywang2020/mano-android-use)** —
+  Host-facing Android **MCP** facade (Cursor / Codex): Host picks goal/plan; mau
+  orchestrates `android_run` / `android_run_plan`; Grounder sees screenshots; L0
+  executes via this Core **without requiring a Pack**. Pins `mano@v0.1.4`.
 
 ## License
 
